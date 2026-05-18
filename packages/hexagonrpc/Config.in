@@ -1,5 +1,5 @@
 config BR2_PACKAGE_HEXAGONRPC
-	bool "Hexagon FastRPC userspace (hexagonrpc)"
+	bool "hexagonrpc [Qualcomm generic]"
 	help
 	  Hexagon FastRPC userspace implementation providing hexagonrpcd
 	  (reverse tunnel daemon for DSP file/memory serving), chrecd

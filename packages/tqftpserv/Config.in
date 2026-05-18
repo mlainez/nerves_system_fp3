@@ -1,5 +1,5 @@
 config BR2_PACKAGE_TQFTPSERV
-	bool "Qualcomm Trivial QFTP Server (tqftpserv)"
+	bool "tqftpserv [Qualcomm generic]"
 	depends on BR2_PACKAGE_QRTR
 	select BR2_PACKAGE_ZSTD
 	help

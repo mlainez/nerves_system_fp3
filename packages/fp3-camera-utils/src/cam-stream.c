@@ -1258,7 +1258,13 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* Got a fresh bayer frame? Process it. */
+		/* Got a fresh bayer frame? Process it.
+		 *
+		 * If multiple frames have queued up (we fell behind sensor
+		 * cadence), drop the older ones and only process the latest.
+		 * This keeps the CAP ring populated so the VFE write-master
+		 * always has somewhere to land — no more "Missing ready buf"
+		 * starvation than absolutely necessary. */
 		if (pfds[0].revents & POLLIN) {
 			struct v4l2_plane pl = {0};
 			struct v4l2_buffer cb = {0};
@@ -1271,6 +1277,25 @@ int main(int argc, char **argv)
 					fprintf(stderr, "cap DQBUF: %s\n", strerror(errno));
 				continue;
 			}
+
+			/* Drain any extra frames that piled up; keep only the
+			 * newest one for processing. */
+			for (;;) {
+				struct v4l2_plane pl2 = {0};
+				struct v4l2_buffer cb2 = {0};
+				cb2.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+				cb2.memory = V4L2_MEMORY_MMAP;
+				cb2.length = 1;
+				cb2.m.planes = &pl2;
+				if (xioctl(cap_fd, VIDIOC_DQBUF, &cb2) < 0) break;
+				/* Stale frame — return it immediately. */
+				struct v4l2_plane qpl = {0};
+				cb.m.planes = &qpl;
+				xioctl(cap_fd, VIDIOC_QBUF, &cb);
+				cb = cb2;
+				pl = pl2;
+			}
+			cb.m.planes = &pl;
 
 			/* Find a free enc OUTPUT buffer */
 			int oi = -1;
