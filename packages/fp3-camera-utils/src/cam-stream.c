@@ -334,6 +334,25 @@ static inline uint8_t clamp_u8(int v)
  * still photography (cam-snap keeps them via its 1024-entry LUT). */
 static uint8_t gamma_lut[256];
 
+/* Live-tuning shared state. Updated by the control thread (text-line
+ * TCP server); main thread re-syncs into local frame values at the top
+ * of each frame's processing pass. The mutex is only contended on the
+ * brief sync window, not the hot demosaic loop. */
+struct ctrl_state {
+	pthread_mutex_t mu;
+	int   wb_r_q8;
+	int   wb_b_q8;
+	int   sat_q8;
+	float gamma_val;
+	float contrast;
+	float brightness;
+	int   rebuild_lut;   /* set by control thread when gamma/contrast/
+				brightness change; main rebuilds at next
+				frame boundary */
+};
+static struct ctrl_state ctrl;
+static int control_port = 0;   /* 0 = no control socket */
+
 /* Apply gamma_lut to 8 packed bytes (uint8x8_t) — scalar inner loop,
  * fast enough since the LUT fits in L1 (256B). Used per R/G/B vector. */
 static inline uint8x8_t apply_lut_x8(uint8x8_t v, const uint8_t *lut)
@@ -563,6 +582,106 @@ static void bayer_to_nv12(const uint8_t *bayer_packed, uint8_t *nv12,
 }
 
 /* ----------------------------------------------------------------------
+ * Live tuning control socket
+ * --------------------------------------------------------------------*/
+
+/* Accepts one client at a time on `control_port` and parses newline-
+ * terminated commands. Commands recognised:
+ *
+ *   wb <r_gain> <g_gain> <b_gain>       — float, R+B converted to Q8.8
+ *   gamma <f>                            — float
+ *   contrast <f>                         — float, 0..1+
+ *   saturation <f>                       — float, 1.0 = neutral
+ *   brightness <f>                       — float, 1.0 = neutral
+ *   show                                 — echo current values
+ *
+ * Unknown commands are silently ignored. The thread runs for the
+ * lifetime of cam-stream and re-accepts on disconnect. */
+static void apply_ctrl_cmd(const char *line, int fd_out)
+{
+	float a, b, c;
+	pthread_mutex_lock(&ctrl.mu);
+	if (sscanf(line, " wb %f %f %f", &a, &b, &c) == 3) {
+		ctrl.wb_r_q8 = (int)(a * 256.0f);
+		ctrl.wb_b_q8 = (int)(c * 256.0f);
+		(void)b;  /* G gain implicit at 1.0 */
+	} else if (sscanf(line, " gamma %f", &a) == 1) {
+		ctrl.gamma_val = a;
+		ctrl.rebuild_lut = 1;
+	} else if (sscanf(line, " contrast %f", &a) == 1) {
+		ctrl.contrast = a;
+		ctrl.rebuild_lut = 1;
+	} else if (sscanf(line, " saturation %f", &a) == 1) {
+		ctrl.sat_q8 = (int)(a * 256.0f);
+	} else if (sscanf(line, " brightness %f", &a) == 1) {
+		ctrl.brightness = a;
+		ctrl.rebuild_lut = 1;
+	} else if (strncmp(line, "show", 4) == 0) {
+		char buf[256];
+		int n = snprintf(buf, sizeof(buf),
+			"wb=%.3f/%.3f gamma=%.3f contrast=%.3f saturation=%.3f brightness=%.3f\n",
+			ctrl.wb_r_q8 / 256.0f, ctrl.wb_b_q8 / 256.0f,
+			ctrl.gamma_val, ctrl.contrast,
+			ctrl.sat_q8 / 256.0f, ctrl.brightness);
+		if (fd_out >= 0 && n > 0) (void)!write(fd_out, buf, (size_t)n);
+	}
+	pthread_mutex_unlock(&ctrl.mu);
+}
+
+static void *control_thread(void *arg)
+{
+	(void)arg;
+	int srv = socket(AF_INET, SOCK_STREAM, 0);
+	if (srv < 0) return NULL;
+	int yes = 1;
+	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	struct sockaddr_in addr = {0};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(control_port);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "cam-stream: control bind :%d failed: %s\n",
+			control_port, strerror(errno));
+		close(srv);
+		return NULL;
+	}
+	if (listen(srv, 1) < 0) {
+		close(srv);
+		return NULL;
+	}
+	fprintf(stderr, "cam-stream: control socket listening on :%d\n", control_port);
+
+	for (;;) {
+		int cli = accept(srv, NULL, NULL);
+		if (cli < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		char buf[256];
+		size_t fill = 0;
+		for (;;) {
+			ssize_t n = read(cli, buf + fill, sizeof(buf) - 1 - fill);
+			if (n <= 0) break;
+			fill += (size_t)n;
+			buf[fill] = '\0';
+			/* Process complete lines. */
+			char *line = buf;
+			char *nl;
+			while ((nl = strchr(line, '\n')) != NULL) {
+				*nl = '\0';
+				apply_ctrl_cmd(line, cli);
+				line = nl + 1;
+			}
+			fill = strlen(line);
+			if (fill > 0) memmove(buf, line, fill);
+		}
+		close(cli);
+	}
+	close(srv);
+	return NULL;
+}
+
+/* ----------------------------------------------------------------------
  * Main
  * --------------------------------------------------------------------*/
 
@@ -746,6 +865,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bitrate") && i+1 < argc) bitrate = atoi(argv[++i]);
 		else if (!strcmp(a, "--frames") && i+1 < argc) max_frames = atoi(argv[++i]);
 		else if (!strcmp(a, "--listen") && i+1 < argc) listen_port = atoi(argv[++i]);
+		else if (!strcmp(a, "--control") && i+1 < argc) control_port = atoi(argv[++i]);
 		else if (!strcmp(a, "--out-nv12")) out_nv12 = 1;
 		else if (!strcmp(a, "--fps") && i+1 < argc) target_fps = atoi(argv[++i]);
 		else if (!strcmp(a, "--autofocus")) do_autofocus = 1;
@@ -782,6 +902,24 @@ int main(int argc, char **argv)
 		bitrate = (strcmp(cam_dev, "/dev/video1") == 0) ? 2000000 : 4000000;
 
 	cam_pipeline_build_lut(gamma_lut, 256, gamma_val, contrast, brightness);
+
+	/* Seed the live-tuning state with the parsed CLI values and start
+	 * the control socket (default port = listen_port + 1 when streaming
+	 * over TCP; override with --control PORT). */
+	pthread_mutex_init(&ctrl.mu, NULL);
+	ctrl.wb_r_q8  = wb_r_q8;
+	ctrl.wb_b_q8  = wb_b_q8;
+	ctrl.sat_q8   = sat_q8;
+	ctrl.gamma_val  = gamma_val;
+	ctrl.contrast   = contrast;
+	ctrl.brightness = brightness;
+	ctrl.rebuild_lut = 0;
+	if (control_port == 0 && listen_port > 0) control_port = listen_port + 1;
+	if (control_port > 0) {
+		pthread_t ctrl_th;
+		pthread_create(&ctrl_th, NULL, control_thread, NULL);
+		pthread_detach(ctrl_th);
+	}
 
 	/* Reconfigure the CAMSS media graph for the binned sensor mode.
 	 * fp3-cam-setup is idempotent and fast (~50 ms of media-ctl calls).
@@ -891,6 +1029,19 @@ int main(int argc, char **argv)
 			int pr = poll(&pf, 1, 1000);
 			if (pr <= 0) continue;
 			if (xioctl(cap_fd, VIDIOC_DQBUF, &cb) < 0) continue;
+			/* Re-sync any live-tuning updates from the control thread
+			 * before processing this frame; rebuild the gamma LUT if
+			 * its inputs changed. */
+			pthread_mutex_lock(&ctrl.mu);
+			wb_r_q8 = ctrl.wb_r_q8;
+			wb_b_q8 = ctrl.wb_b_q8;
+			sat_q8  = ctrl.sat_q8;
+			if (ctrl.rebuild_lut) {
+				cam_pipeline_build_lut(gamma_lut, 256,
+					ctrl.gamma_val, ctrl.contrast, ctrl.brightness);
+				ctrl.rebuild_lut = 0;
+			}
+			pthread_mutex_unlock(&ctrl.mu);
 			bayer_to_nv12(cap_bufs[cb.index].p, nv12,
 				      cam_w, cam_h, cap_bytesperline,
 				      OUT_W, OUT_H,
@@ -1051,6 +1202,18 @@ int main(int argc, char **argv)
 			 * encoder + sensor allow. target_fps still feeds the
 			 * Venus rate controller via VIDIOC_S_PARM. */
 			(void)target_interval_us; (void)last_submit_us;
+
+			/* Pull any live tuning updates before this frame. */
+			pthread_mutex_lock(&ctrl.mu);
+			wb_r_q8 = ctrl.wb_r_q8;
+			wb_b_q8 = ctrl.wb_b_q8;
+			sat_q8  = ctrl.sat_q8;
+			if (ctrl.rebuild_lut) {
+				cam_pipeline_build_lut(gamma_lut, 256,
+					ctrl.gamma_val, ctrl.contrast, ctrl.brightness);
+				ctrl.rebuild_lut = 0;
+			}
+			pthread_mutex_unlock(&ctrl.mu);
 
 			bayer_to_nv12(cap_bufs[cb.index].p,
 				      enc_out_bufs[oi].p,
