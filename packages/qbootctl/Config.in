@@ -1,0 +1,26 @@
+config BR2_PACKAGE_QBOOTCTL
+	bool "qbootctl [Qualcomm generic]"
+	select BR2_PACKAGE_ZLIB
+	help
+	  qcom bootctrl HAL port for Linux — the userspace half of the
+	  bootloader's A/B slot accounting on Qualcomm devices.
+
+	  On boot, the bootloader decrements the active slot's retry
+	  counter. After N failed boots in a row (typically 3) the
+	  bootloader falls back to the other slot, or — if neither slot
+	  is healthy — drops into fastboot. `qbootctl -m` writes "boot
+	  successful" back into the slot metadata so the counter is
+	  reset.
+
+	  Without this tool a Nerves device will eventually end up in
+	  fastboot after enough reboots, even with a perfectly working
+	  firmware, because nothing is telling the bootloader the boot
+	  worked.
+
+	  Provides /usr/bin/qbootctl:
+	    qbootctl              dump slot info
+	    qbootctl -m [SLOT]    mark a boot as successful
+	    qbootctl -s SLOT      set active slot
+	    qbootctl -c           print current slot
+
+	  https://github.com/linux-msm/qbootctl

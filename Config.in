@@ -12,6 +12,7 @@ source "$NERVES_DEFCONFIG_DIR/packages/rmtfs/Config.in"
 source "$NERVES_DEFCONFIG_DIR/packages/tqftpserv/Config.in"
 source "$NERVES_DEFCONFIG_DIR/packages/hexagonrpc/Config.in"
 source "$NERVES_DEFCONFIG_DIR/packages/reboot-mode/Config.in"
+source "$NERVES_DEFCONFIG_DIR/packages/qbootctl/Config.in"
 source "$NERVES_DEFCONFIG_DIR/packages/fp3-camera-utils/Config.in"
 
 endmenu
