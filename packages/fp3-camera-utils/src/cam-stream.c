@@ -352,7 +352,8 @@ struct ctrl_state {
 };
 static struct ctrl_state ctrl;
 static int control_port = 0;   /* 0 = no control socket */
-static const char *cam_subdev_path = NULL;   /* set in main() for exposure/gain ctrl */
+static const char *cam_subdev_path = NULL;   /* sensor subdev (exposure/gain ctrl) */
+static const char *lens_dev_path   = NULL;   /* VCM subdev (live focus ctrl; rear only) */
 
 /* Apply gamma_lut to 8 packed bytes (uint8x8_t) — scalar inner loop,
  * fast enough since the LUT fits in L1 (256B). Used per R/G/B vector. */
@@ -598,15 +599,18 @@ static void bayer_to_nv12(const uint8_t *bayer_packed, uint8_t *nv12,
  *
  * Unknown commands are silently ignored. The thread runs for the
  * lifetime of cam-stream and re-accepts on disconnect. */
-/* Push a sensor-subdev control (exposure / analogue gain). These bypass
- * the per-frame pipeline state — they reprogram the sensor directly. */
-static void set_sensor_ctrl(int v4l2_cid, int value, const char *label)
+/* Push a V4L2 control on an arbitrary subdev path. Used for sensor
+ * exposure/gain (cam_subdev_path) and the rear VCM focus position
+ * (lens_dev_path). Bypasses the per-frame pipeline state — reprograms
+ * the hardware directly. */
+static void set_subdev_ctrl(const char *path, int v4l2_cid, int value,
+			    const char *label)
 {
-	if (!cam_subdev_path) return;
-	int fd = open(cam_subdev_path, O_RDWR);
+	if (!path) return;
+	int fd = open(path, O_RDWR);
 	if (fd < 0) {
 		fprintf(stderr, "cam-stream: open %s for %s: %s\n",
-			cam_subdev_path, label, strerror(errno));
+			path, label, strerror(errno));
 		return;
 	}
 	struct v4l2_control c = { .id = v4l2_cid, .value = value };
@@ -638,11 +642,16 @@ static void apply_ctrl_cmd(const char *line, int fd_out)
 		ctrl.rebuild_lut = 1;
 	} else if (sscanf(line, " exposure %d", &i) == 1) {
 		pthread_mutex_unlock(&ctrl.mu);
-		set_sensor_ctrl(V4L2_CID_EXPOSURE, i, "exposure");
+		set_subdev_ctrl(cam_subdev_path, V4L2_CID_EXPOSURE, i, "exposure");
 		return;
 	} else if (sscanf(line, " gain %d", &i) == 1) {
 		pthread_mutex_unlock(&ctrl.mu);
-		set_sensor_ctrl(V4L2_CID_ANALOGUE_GAIN, i, "gain");
+		set_subdev_ctrl(cam_subdev_path, V4L2_CID_ANALOGUE_GAIN, i, "gain");
+		return;
+	} else if (sscanf(line, " focus %d", &i) == 1) {
+		pthread_mutex_unlock(&ctrl.mu);
+		if (i < 0) i = 0; else if (i > 1023) i = 1023;
+		set_subdev_ctrl(lens_dev_path, V4L2_CID_FOCUS_ABSOLUTE, i, "focus");
 		return;
 	} else if (strncmp(line, "show", 4) == 0) {
 		char buf[256];
@@ -944,6 +953,8 @@ int main(int argc, char **argv)
 	ctrl.rebuild_lut = 0;
 	if (control_port == 0 && listen_port > 0) control_port = listen_port + 1;
 	cam_subdev_path = cam_subdev;
+	if (strcmp(cam_dev, "/dev/video0") == 0)
+		lens_dev_path = "/dev/v4l-subdev17";  /* DW9800W rear VCM */
 	if (control_port > 0) {
 		pthread_t ctrl_th;
 		pthread_create(&ctrl_th, NULL, control_thread, NULL);

@@ -9,7 +9,7 @@
 #
 ################################################################################
 
-FP3_CAMERA_UTILS_VERSION = 0.7.1
+FP3_CAMERA_UTILS_VERSION = 0.7.2
 FP3_CAMERA_UTILS_SITE = $(NERVES_DEFCONFIG_DIR)/packages/fp3-camera-utils/src
 FP3_CAMERA_UTILS_SITE_METHOD = local
 FP3_CAMERA_UTILS_LICENSE = MIT
