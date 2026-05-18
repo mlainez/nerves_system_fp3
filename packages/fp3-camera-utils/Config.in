@@ -1,0 +1,28 @@
+config BR2_PACKAGE_FP3_CAMERA_UTILS
+	bool "fp3-camera-utils [FP3+ only]"
+	depends on BR2_PACKAGE_BAYER2RGB_NEON_ARCH_SUPPORTS
+	select BR2_PACKAGE_BAYER2RGB_NEON
+	select BR2_PACKAGE_JPEG
+	help
+	  Fairphone 3+ specific camera tooling: stills, live video, raw
+	  capture, and an i2c bus probe used during sensor bring-up.
+
+	  Hardware-bound to the msm8953 CAMSS pipeline and the FP3+'s
+	  two sensors (rear: Samsung S5KGM1SP / front: Samsung S5K3P9SP).
+	  All four binaries assume the FP3+ media graph and will not be
+	  useful on other boards.
+
+	  Installs four binaries plus a setup helper:
+
+	    cam-snap    Single-shot JPEG with software ISP (5x5 MHC
+	                demosaic, gray-world AWB, gamma + tone curve).
+	    cam-stream  Live H.264 over TCP via Venus encoder.
+	    cam-grab    Raw 10-bit packed Bayer dump (for piping into
+	                GStreamer pipelines that don't grok pgAA).
+	    i2cprobe    Tiny i2c-bus scanner used while bringing up
+	                camera sensors and VCMs.
+	    fp3-cam-setup  Configures the CAMSS media graph (csiphy →
+	                csid → ispif → vfe_rdi → /dev/videoN) for the
+	                requested sensor.
+
+	  Driven from Elixir via the fp3_camera library.
