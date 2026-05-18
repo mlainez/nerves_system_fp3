@@ -1,0 +1,26 @@
+config BR2_PACKAGE_CAM_SNAP
+	bool "cam-snap"
+	depends on BR2_PACKAGE_BAYER2RGB_NEON_ARCH_SUPPORTS
+	select BR2_PACKAGE_BAYER2RGB_NEON
+	select BR2_PACKAGE_JPEG
+	help
+	  Single-shot still-image tool for the msm8953 CAMSS pipeline.
+
+	  msm8953 CAMSS only emits raw 10-bit packed Bayer; without any
+	  ISP processing the output is heavily green-tinted, washed out,
+	  and exposed wrong. cam-snap implements a small software ISP
+	  end-to-end:
+
+	    * Set sensor exposure / analogue gain via V4L2 controls
+	    * Capture an SGRBG10P frame via mplane mmap
+	    * Unpack 10-bit packed → linear 16-bit Bayer
+	    * Black-level subtract (64 in 10-bit space)
+	    * Gray-world auto white balance (per-channel digital gain)
+	    * NEON-accelerated bilinear demosaic via libbayer2rgb-neon
+	    * 3x3 sRGB color-correction matrix
+	    * Gamma 2.2 + clip to 8-bit RGB
+	    * JPEG encode via libjpeg-turbo
+
+	  Output is a viewable JPEG saved to disk. Designed to be called
+	  from Elixir (via :ex_camera) so a higher-level layer can drive
+	  capture, retries, sensor-control overrides, etc.

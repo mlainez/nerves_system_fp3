@@ -1,0 +1,71 @@
+arm64: dts: qcom: sdm632-fairphone-fp3p: enable battery / pmi632_qg / pmi632_charger
+
+The fp3+ DTS inherits pmi632.dtsi, which declares pmi632_qg (fuel
+gauge) and pmi632_charger (SMB5) with status = "disabled". The regular
+fp3.dts enables both and wires them to a simple-battery profile; the
+fp3+ DTS never did. Without these nodes set to "okay" and pointed at a
+battery, the qcom_pmi632_qg / qcom_pmi632_charger drivers have nothing
+to bind to and /sys/class/power_supply/ never gets a battery entry.
+
+The FP3+ uses the exact same cell as the FP3 (same PMIC, 3000 mAh,
+same OCV curve), so the simple-battery profile + qg/charger enables
+are copied verbatim from sdm632-fairphone-fp3.dts.
+
+Signed-off-by: nerves_system_fp3 <root@localhost>
+---
+--- a/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
++++ b/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
+@@ -46,6 +46,32 @@
+ 		};
+ 	};
+ 
++
++	battery: battery {
++		compatible = "simple-battery";
++		voltage-min-design-microvolt = <3400000>;
++		voltage-max-design-microvolt = <4390000>;
++		energy-full-design-microwatt-hours = <11400000>;
++		charge-full-design-microamp-hours = <3000000>;
++
++		ocv-capacity-celsius = <25>;
++		ocv-capacity-table-0 = <4370000 100>, <4337400 98>, <4307400 96>,
++			<4280600 94>, <4256600 92>, <4233100 90>, <4209700 88>,
++			<4186700 86>, <4164000 84>, <4141700 82>, <4120000 80>,
++			<4099000 78>, <4078600 76>, <4058700 74>, <4039300 72>,
++			<4021400 70>, <4006000 68>, <3990500 66>, <3971300 64>,
++			<3949500 62>, <3927700 60>, <3905200 58>, <3884600 56>,
++			<3868200 54>, <3854000 52>, <3841600 50>, <3830500 48>,
++			<3820400 46>, <3811100 44>, <3802400 42>, <3795100 40>,
++			<3788600 38>, <3783000 36>, <3778200 34>, <3774000 32>,
++			<3769900 30>, <3765800 28>, <3761300 26>, <3755300 24>,
++			<3748200 22>, <3739400 20>, <3728100 18>, <3715600 16>,
++			<3701200 14>, <3686100 12>, <3680100 10>, <3678200 9>,
++			<3676900 8>, <3673600 7>, <3667900 6>, <3650200 5>,
++			<3610600 4>, <3555200 3>, <3481300 2>, <3374500 1>,
++			<3193600 0>;
++	};
++
+ 	gpio-keys {
+ 		compatible = "gpio-keys";
+ 
+@@ -286,6 +312,20 @@
+ 	status = "okay";
+ };
+ 
++
++&pmi632_qg {
++	monitored-battery = <&battery>;
++	power-supplies = <&pmi632_charger>;
++	io-channels = <&pmi632_adc ADC5_BAT_THERM_100K_PU>;
++	io-channel-names = "batt-therm";
++	status = "okay";
++};
++
++&pmi632_charger {
++	monitored-battery = <&battery>;
++	status = "okay";
++};
++
+ &q6afedai {
+ 	dai@127 {
+ 		reg = <QUINARY_MI2S_RX>;

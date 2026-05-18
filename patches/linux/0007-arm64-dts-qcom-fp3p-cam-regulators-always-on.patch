@@ -1,0 +1,31 @@
+From: nerves_system_fp3 <devs@spin42.com>
+Date: Sat, 17 May 2026 11:00:00 +0200
+Subject: arm64: dts: qcom: fp3p: cam_vio always-on for the rear VCM
+
+The DW9800 voice coil motor on bus 3-000c needs 1.8V on its I²C
+interface side (cam_vio) to ACK transactions. The upstream `dw9714`
+driver — which we use for DW9800 because the wire protocol is
+compatible — only manages one supply (the 2.85V analog rail, mapped
+to cam_vaf). So if the driver's probe runs before any sensor has
+brought cam_vio up, the very first I²C write to the actuator NACKs
+and the runtime-PM state goes permanently into error.
+
+Keeping cam_vio always-on (it's shared with the sensor anyway) makes
+the VCM reachable from boot. The extra static current draw is ~1 mA.
+
+Signed-off-by: nerves_system_fp3 <devs@spin42.com>
+---
+ arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts b/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
+--- a/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
++++ b/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
+@@ -106,6 +106,7 @@
+ 		gpio = <&tlmm 130 GPIO_ACTIVE_HIGH>;
+ 		enable-active-high;
+ 		startup-delay-us = <10000>;
++		regulator-always-on;
+ 	};
+
+ 	/* Rear camera AF actuator supply, active-high enable on GPIO 128 */

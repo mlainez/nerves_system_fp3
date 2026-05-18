@@ -1,0 +1,37 @@
+From: nerves_system_fp3 <devs@spin42.com>
+Date: Sat, 17 May 2026 09:40:00 +0200
+Subject: arm64: dts: qcom: fp3p: fix AK7374 VCM I²C address
+
+The DT had the rear-camera VCM at I²C address 0x18, which produced
+`ak7375_vcm_resume I2C failure: -6` at every boot — ENXIO from an
+unanswered probe. An i2cdetect-style scan of the CCI bus showed the
+actuator actually responds at **0x0c** (reg 0x00 returns sensible
+position bytes), matching the 7-bit address in the AK73xx datasheet.
+
+The 0x18 in the original node looks like it came from confusing the
+8-bit write address (0x18 = 0x0c << 1) with the 7-bit Linux DT form.
+Fixing the address lets the upstream ak7375 driver successfully bring
+the VCM out of standby and drive the focus position register, which
+in turn lets contrast-detect AF in userspace actually move the lens.
+
+Signed-off-by: nerves_system_fp3 <devs@spin42.com>
+---
+ arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts b/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
+index aaaaaaaaaaaa..bbbbbbbbbbbb 100644
+--- a/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
++++ b/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
+@@ -658,9 +658,9 @@
+ 	};
+
+ 	/* AK7374 voice coil motor — rear camera autofocus */
+-	actuator: camera-lens@18 {
++	actuator: camera-lens@c {
+ 		compatible = "asahi-kasei,ak7374";
+-		reg = <0x18>;
++		reg = <0x0c>;
+
+ 		vdd-supply = <&cam_vaf>;
+ 		vio-supply = <&cam_vio>;

@@ -1,0 +1,39 @@
+arm64: dts: qcom: sdm632-fairphone-fp3p: add batt-therm ADC channel
+
+pmi632.dtsi declares pmi632_adc (SPMI ADC5) with the chip-level channels
+(ref_gnd, vref_1p25, die_temp, usb_in_i/v, chg_temp, vph_pwr, vbat_sns,
+bat_id). The battery thermistor is board-level — the thermistor itself
+plus its pull-up resistor depend on the phone's PCB, so each board adds
+its own `channel@4a` (ADC5_BAT_THERM_100K_PU) to pmi632_adc.
+
+fp3.dts adds this block. fp3p uses the same battery+thermistor wiring
+but the override was missing, so when pmi632_qg tries to resolve
+`io-channels = <&pmi632_adc ADC5_BAT_THERM_100K_PU>` the lookup fails:
+
+  ERROR: could not get IIO channel ...fuel-gauge@4800:batt-therm(0)
+
+QG then falls back to OCV-derived temperature estimation, which works
+for capacity reporting but means real `temp` reads (and thermal
+protection) are uninformed. Add the same channel block fp3.dts uses.
+
+Signed-off-by: nerves_system_fp3 <root@localhost>
+---
+--- a/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
++++ b/arch/arm64/boot/dts/qcom/sdm632-fairphone-fp3p.dts
+@@ -313,6 +313,16 @@
+ };
+ 
+ 
++&pmi632_adc {
++	channel@4a {
++		reg = <ADC5_BAT_THERM_100K_PU>;
++		qcom,hw-settle-time = <200>;
++		qcom,pre-scaling = <1 1>;
++		qcom,ratiometric;
++		label = "batt_therm";
++	};
++};
++
+ &pmi632_qg {
+ 	monitored-battery = <&battery>;
+ 	power-supplies = <&pmi632_charger>;

@@ -1,0 +1,16 @@
+# Informational — actual mounts are issued by erlinit (see
+# /etc/erlinit.config -m directives) plus a few automatic ones below.
+
+# <fs>             <mountpoint>           <type>    <options>                        <dump> <pass>
+proc               /proc                  proc      defaults                          0 0
+sysfs              /sys                   sysfs     defaults                          0 0
+devpts             /dev/pts               devpts    defaults                          0 0
+tmpfs              /run                   tmpfs     defaults,nosuid,nodev,mode=0755  0 0
+tmpfs              /tmp                   tmpfs     defaults,nosuid,nodev,mode=1777  0 0
+tmpfs              /var                   tmpfs     defaults,nosuid,nodev,mode=0755  0 0
+configfs           /sys/kernel/config     configfs  defaults                          0 0
+
+# Subpartitions of /dev/mmcblk0p62 set up by the citronics initramfs
+# (kpartx -asf) and mounted by erlinit.
+/dev/mmcblk0p62p1  /boot                  ext2      ro,nodev,noexec,nosuid           0 0
+/dev/mmcblk0p62p3  /root                  f2fs      nodev                             0 0

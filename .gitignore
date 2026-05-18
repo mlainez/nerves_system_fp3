@@ -1,0 +1,10 @@
+/_build
+/deps
+/cover
+/doc
+/.fetch
+/.nerves
+build.log
+erl_crash.dump
+*.ez
+/buildroot-*

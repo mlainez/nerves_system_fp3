@@ -1,0 +1,24 @@
+# Kernel modules to copy into the initramfs.
+#
+# Intentionally empty for the Fairphone 3.
+#
+# The nerves_system_fp3 kernel config already makes everything the
+# citronics initramfs needs at boot time built-in (=y):
+#
+#   CONFIG_SQUASHFS=y      ← rootfs filesystem
+#   CONFIG_SQUASHFS_LZ4=y
+#   CONFIG_F2FS_FS=y       ← application-data partition
+#   CONFIG_EXT2_FS=y       ← boot partition
+#   CONFIG_EXT4_FS=y
+#   CONFIG_VFAT_FS=y / CONFIG_FAT_FS=y
+#   CONFIG_BLK_DEV_DM=y / CONFIG_DM_*=y  ← kpartx
+#   CONFIG_USB_GADGET=y / CONFIG_USB_ETH=y  ← USB recovery
+#   …plus the Qualcomm QRTR / remoteproc / fastrpc stack
+#
+# Carrying additional .ko files into the initramfs just inflates the
+# cpio.gz past lk2nd's max-initrd size and there is nothing to load
+# from inside the initramfs.
+#
+# If a future kernel revision flips one of the above to =m, list the
+# module here as a path relative to /lib/modules/<ver>/ — for example
+#   kernel/fs/squashfs/squashfs.ko

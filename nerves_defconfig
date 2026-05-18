@@ -1,0 +1,216 @@
+BR2_aarch64=y
+BR2_cortex_a53=y
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://github.com/nerves-project/toolchains/releases/download/v14.2.0/nerves_toolchain_aarch64_nerves_linux_gnu-linux_${shell uname -m}-14.2.0-C3B80E7.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="aarch64-nerves-linux-gnu"
+BR2_TOOLCHAIN_EXTERNAL_GCC_14=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_5_4=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+# BR2_TOOLCHAIN_EXTERNAL_INET_RPC is not set
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+BR2_TAR_OPTIONS="--no-same-owner"
+BR2_BACKUP_SITE="http://dl.nerves-project.org"
+BR2_ENABLE_DEBUG=y
+BR2_GLOBAL_PATCH_DIR="${BR2_EXTERNAL_NERVES_PATH}/patches ${NERVES_DEFCONFIG_DIR}/patches"
+BR2_REPRODUCIBLE=y
+BR2_ROOTFS_SKELETON_CUSTOM=y
+BR2_ROOTFS_SKELETON_CUSTOM_PATH="${BR2_EXTERNAL_NERVES_PATH}/board/nerves-common/skeleton"
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
+BR2_ROOTFS_DEVICE_TABLE="${BR2_EXTERNAL_NERVES_PATH}/board/nerves-common/device_table.txt"
+BR2_ENABLE_LOCALE_WHITELIST="locale-archive"
+BR2_GENERATE_LOCALE="en_US.UTF-8"
+BR2_ROOTFS_OVERLAY="${BR2_EXTERNAL_NERVES_PATH}/board/nerves-common/rootfs_overlay ${NERVES_DEFCONFIG_DIR}/rootfs_overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="${NERVES_DEFCONFIG_DIR}/post-build.sh ${BR2_EXTERNAL_NERVES_PATH}/board/nerves-common/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="${NERVES_DEFCONFIG_DIR}/post-createfs.sh"
+
+# Kernel — mlainez/linux-msm8953 staging. This is the fork the citronics
+# buildroot port has been validated against; the kernel config in this
+# system was extracted from that same tree, so they need to stay in sync.
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_GIT=y
+BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/mlainez/linux-msm8953"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="staging"
+BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="${NERVES_DEFCONFIG_DIR}/linux-6.6.defconfig"
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="qcom/sdm632-fairphone-fp3 qcom/sdm632-fairphone-fp3p"
+BR2_LINUX_KERNEL_DTB_OVERLAY_SUPPORT=y
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+BR2_LINUX_KERNEL_INSTALL_TARGET=y
+
+# Busybox / base userland
+BR2_PACKAGE_BUSYBOX_CONFIG="${BR2_EXTERNAL_NERVES_PATH}/board/nerves-common/busybox.config"
+# Add citronics-initramfs essentials (switch_root, mdev, ln, telnetd, …)
+# on top of the Nerves base config. See busybox-fp3.fragment for the
+# full list + rationale.
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="${NERVES_DEFCONFIG_DIR}/busybox-fp3.fragment"
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_PACKAGE_E2FSPROGS=y
+BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
+BR2_PACKAGE_F2FS_TOOLS=y
+BR2_PACKAGE_GENEXT2FS=y
+# linux-firmware is intentionally NOT enabled. fp3-firmware provides the
+# only Adreno blobs the FP3+ needs (a530_pm4.fw + a530_pfp.fw, plus the
+# FP3-specific a506_zap signed shader). Enabling BR2_PACKAGE_LINUX_FIRMWARE
+# with QCOM_ADRENO=y also ships the entire Adreno catalogue (A2xx..A7xx)
+# and apq8096/apq8016/aic100 trees, ~15 MB of dead weight on this board.
+# wireless-regdb covers the regulatory database we'd otherwise want.
+# BR2_PACKAGE_LINUX_FIRMWARE is not set
+BR2_PACKAGE_USBUTILS=y
+BR2_PACKAGE_CA_CERTIFICATES=y
+BR2_PACKAGE_DTC=y
+BR2_PACKAGE_DTC_PROGRAMS=y
+BR2_PACKAGE_KMOD=y
+BR2_PACKAGE_KMOD_TOOLS=y
+BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+# Required by the citronics initramfs to kpartx the userdata partition
+# into boot/rootfs/app subpartitions at boot.
+BR2_PACKAGE_MULTIPATH_TOOLS=y
+BR2_PACKAGE_PARTED=y
+
+# Camera + Venus video codec tooling. libv4l ships libv4lconvert/1/2;
+# its `tools` sub-option installs media-ctl (CAMSS pipeline links + pad
+# formats), v4l2-ctl (introspect / single-frame capture), v4l2-compliance,
+# ir-keytable, etc. yavta is a lightweight V4L2 streaming test tool
+# handy for sanity-checking the pipeline before bringing GStreamer or
+# Membrane on top. Note: buildroot 2025.11 renamed v4l-utils → libv4l.
+BR2_PACKAGE_LIBV4L=y
+BR2_PACKAGE_LIBV4L_UTILS=y
+BR2_PACKAGE_YAVTA=y
+
+# GStreamer 1.x — the high-level camera + video pipeline driver. We use it
+# both to capture stills (camera → bayer2rgb → JPEG) and to stream live
+# video (camera → bayer2rgb → NV12 → Venus H.264 via v4l2 M2M → RTSP).
+# The bayer2rgb-neon plugin understands 10-bit packed Bayer (SGRBG10P)
+# straight off the CAMSS RDI lane, so we don't need a software unpack.
+BR2_PACKAGE_GSTREAMER1=y
+BR2_PACKAGE_GST1_PLUGINS_BASE=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_APP=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_TYPEFIND=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_VIDEOCONVERTSCALE=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_VIDEORATE=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_VIDEOTESTSRC=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_TCP=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_JPEG=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PNG=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_V4L2=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_V4L2_PROBE=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_MULTIPART=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_RTP=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_RTPMANAGER=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_RTSP=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_UDP=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_AUTODETECT=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_DEBUGUTILS=y
+BR2_PACKAGE_GST1_PLUGINS_BAD=y
+BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_BAYER=y
+BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_MPEGTSMUX=y
+BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_VIDEOPARSERS=y
+BR2_PACKAGE_GST1_PLUGINS_BAYER2RGB_NEON=y
+BR2_PACKAGE_GST1_RTSP_SERVER=y
+
+# ffmpeg — does the heavy lifting for live video on the FP3+:
+# V4L2 bayer capture → demosaic → NV12 → Venus H.264 (h264_v4l2m2m) →
+# MPEG-TS over HTTP (-listen 1 makes ffmpeg itself the HTTP server).
+# VLC opens http://nerves.local:8888/cam and Just Works. The Elixir
+# side spawns ffmpeg per camera via Port and supervises it. v4l2_m2m
+# auto-detects when libv4l is present (already enabled above).
+BR2_PACKAGE_FFMPEG=y
+BR2_PACKAGE_FFMPEG_FFMPEG=y
+BR2_PACKAGE_FFMPEG_GPL=y
+BR2_PACKAGE_FFMPEG_SWSCALE=y
+
+# libcamera — handles 3A (AE/AWB/AGC) + black-level / colour matrix /
+# gamma in its SoftwareISP. The msm8953 CAMSS exposes only raw Bayer
+# to userspace; without these algorithms the output looks heavily green
+# and washed-out. The "simple" pipeline handler is the matching one
+# for non-vendor-ISP devices like ours.
+BR2_PACKAGE_LIBCAMERA=y
+BR2_PACKAGE_LIBCAMERA_PIPELINE_SIMPLE=y
+BR2_PACKAGE_LIBCAMERA_V4L2=y
+# libcamera-apps (raspicam clone) wants boost::program_options;
+# we don't ship boost. The libcamera library itself is enough — the
+# `cam` test CLI from the library build is copied into the rootfs
+# overlay separately, see post-build.sh.
+# BR2_PACKAGE_LIBCAMERA_APPS is not set
+
+# Audio — ALSA tooling for the FP3 loudspeaker via the ADSP
+BR2_PACKAGE_ALSA_LIB=y
+BR2_PACKAGE_ALSA_UTILS=y
+BR2_PACKAGE_ALSA_UTILS_AMIXER=y
+BR2_PACKAGE_ALSA_UTILS_APLAY=y
+BR2_PACKAGE_ALSA_UTILS_ALSACTL=y
+BR2_PACKAGE_ALSA_UTILS_ALSAMIXER=y
+
+# Modem stack — the FP2 Nerves stack drives QMI directly from Elixir via
+# `:qmi` and `:vintage_net_qmi`. We only ship the kernel-side helpers
+# (rmtfs / qrtr / tqftpserv / hexagonrpcd) plus iptables for VintageNet.
+BR2_PACKAGE_LIBMNL=y
+BR2_PACKAGE_IPTABLES=y
+
+# Bluetooth
+BR2_PACKAGE_BLUEZ_TOOLS=y
+BR2_PACKAGE_BLUEZ5_UTILS=y
+BR2_PACKAGE_BLUEZ5_UTILS_CLIENT=y
+BR2_PACKAGE_BLUEZ5_UTILS_TOOLS=y
+
+# Wi-Fi
+BR2_PACKAGE_WIRELESS_REGDB=y
+BR2_PACKAGE_WIRELESS_TOOLS=y
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_AP_SUPPORT=y
+BR2_PACKAGE_WPA_SUPPLICANT_EAP=y
+BR2_PACKAGE_WPA_SUPPLICANT_WPS=y
+BR2_PACKAGE_WPA_SUPPLICANT_WPA3=y
+BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+BR2_PACKAGE_WPA_SUPPLICANT_WPA_CLIENT_SO=y
+BR2_PACKAGE_WPA_SUPPLICANT_PASSPHRASE=y
+BR2_PACKAGE_WPA_SUPPLICANT_DBUS=y
+
+# Host helpers
+BR2_PACKAGE_HOST_DOSFSTOOLS=y
+BR2_PACKAGE_HOST_GENEXT2FS=y
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_MTOOLS=y
+
+# Nerves bookkeeping
+BR2_NERVES_SYSTEM_NAME="nerves_system_fp3"
+BR2_NERVES_ADDITIONAL_IMAGE_FILES="${NERVES_DEFCONFIG_DIR}/fwup.conf"
+BR2_PACKAGE_NBTTY=y
+BR2_PACKAGE_NERVES_CONFIG=y
+BR2_PACKAGE_NERVES_CONFIG_ACCEPT_RNG_NOTICE=y
+
+# Root filesystem: squashfs A/B inside the Android userdata partition.
+# lk2nd-msm8953 reads /extlinux/extlinux.conf from the boot subpartition
+# (ext2, built by scripts/create-boot-img.sh into BINARIES_DIR/boot.img)
+# and loads kernel + DTB + the citronics initramfs from it. The initramfs
+# kpartx-maps mmcblk0p62 into p62p1 (boot) + p62p2 (rootfs squashfs) +
+# p62p3 (f2fs app data).
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS4_LZ4=y
+# BR2_TARGET_ROOTFS_EXT2 is not set
+# BR2_TARGET_ROOTFS_TAR is not set
+
+BR2_PACKAGE_FP3_FIRMWARE=y
+BR2_PACKAGE_CITRONICS_INITRAMFS=y
+BR2_PACKAGE_UNUDHCPD=y
+BR2_PACKAGE_QRTR=y
+BR2_PACKAGE_RMTFS=y
+BR2_PACKAGE_TQFTPSERV=y
+BR2_PACKAGE_HEXAGONRPC=y
+BR2_PACKAGE_REBOOT_MODE=y
+BR2_PACKAGE_CAM_GRAB=y
+BR2_PACKAGE_CAM_SNAP=y
+BR2_PACKAGE_JPEG=y
+BR2_PACKAGE_JPEG_TURBO=y
+
+# ModemManager is no longer pulled in: the Elixir runtime drives the modem
+# directly through the `:qmi` library (the same stack the FP2 Nerves system
+# uses). `libqmi` stays only because rmtfs and tqftpserv link against
+# `libqrtr` from the same source tree.
+# BR2_PACKAGE_MODEM_MANAGER is not set
