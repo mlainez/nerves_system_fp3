@@ -28,6 +28,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -37,22 +38,23 @@
 #include <arm_neon.h>
 #include "cam_pipeline.h"
 
-/* Output dimensions are fixed; bayer dimensions come from cam_pipeline.h.
- * 2× downscale + center-crop produces a 1920×1080 NV12 frame from either
- * front (4608×3456 → 2304×1728 crop 192/324) or rear (4000×3000 → 2000×
- * 1500 crop 40/210). */
-#define OUT_W            1920
-#define OUT_H            1080
+/* cam-stream uses each sensor's 2×2-binned mode (4× less sensor→DRAM
+ * bandwidth + better SNR — critical for wcn36xx wifi co-existence)
+ * and produces a 1920×1080 NV12 stream via 1:1 bilinear demosaic of a
+ * center-cropped sub-rectangle of the binned bayer.
+ *
+ * Front s5k3p9sp binned: 4608×3456 → 2304×1728 → crop (192, 324) → 1920×1080
+ * Rear  s5kgm1sp binned: 4000×3000 → 2000×1500 → crop (40, 210)  → 1920×1080
+ *
+ * cam-snap still uses full sensor resolution via cam_pipeline.h's
+ * CAM_BAYER_W_* constants. */
+#define FRONT_BAYER_W_BINNED   2304
+#define FRONT_BAYER_H_BINNED   1728
+#define REAR_BAYER_W_BINNED    2000
+#define REAR_BAYER_H_BINNED    1500
 
-#define FRONT_BAYER_W    CAM_BAYER_W_FRONT
-#define FRONT_BAYER_H    CAM_BAYER_H_FRONT
-#define FRONT_CROP_X     ((FRONT_BAYER_W/2 - OUT_W) / 2)
-#define FRONT_CROP_Y     ((FRONT_BAYER_H/2 - OUT_H) / 2)
-
-#define REAR_BAYER_W     CAM_BAYER_W_REAR
-#define REAR_BAYER_H     CAM_BAYER_H_REAR
-#define REAR_CROP_X      ((REAR_BAYER_W/2 - OUT_W) / 2)
-#define REAR_CROP_Y      ((REAR_BAYER_H/2 - OUT_H) / 2)
+#define OUT_W   1920
+#define OUT_H   1080
 
 #define CAP_BUFS     4
 #define ENC_OUT_BUFS 4
@@ -82,7 +84,8 @@ static void on_sigint(int s) { (void)s; running = 0; }
 static int cap_open_and_setup(const char *dev, const char *subdev,
 			      int width, int height,
 			      int exposure, int gain,
-			      struct buf bufs[CAP_BUFS])
+			      struct buf bufs[CAP_BUFS],
+			      int *out_bytesperline)
 {
 	int fd = open(dev, O_RDWR | O_NONBLOCK);
 	if (fd < 0) die("open %s: %s", dev, strerror(errno));
@@ -112,6 +115,14 @@ static int cap_open_and_setup(const char *dev, const char *subdev,
 	fmt.fmt.pix_mp.num_planes = 1;
 	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
 		die("cap S_FMT: %s", strerror(errno));
+
+	/* Capture the actual row stride V4L2 gave us — for some packed
+	 * bayer widths (e.g., 2000 on the rear ybin mode) the driver pads
+	 * each row up to a multiple of 8 bytes, so 2000*5/4=2500 becomes
+	 * 2504. Walking the buffer with the unpadded stride would misalign
+	 * every row after the first and produce red/blue banding garbage. */
+	if (out_bytesperline)
+		*out_bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 
 	struct v4l2_requestbuffers req = {0};
 	req.count = CAP_BUFS;
@@ -231,6 +242,20 @@ static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 				 MAP_SHARED, fd, pl.m.mem_offset);
 		if (outs[i].p == MAP_FAILED)
 			die("enc OUTPUT mmap[%d]: %s", i, strerror(errno));
+		/* Venus pads the NV12 input buffer up to its macroblock-aligned
+		 * size (typically rounded to 16-pixel height = 1088 rows for
+		 * 1080p). Our kernel writes only 1080 rows; the trailing
+		 * uninitialized bytes get read by the encoder and show up as a
+		 * thick green band at the bottom of the decoded stream. Pre-
+		 * init the buffer to a neutral NV12 black so any unwritten
+		 * region looks like padding, not garbage. */
+		size_t y_bytes = (size_t)OUT_W * OUT_H;
+		if (y_bytes <= outs[i].len) {
+			memset(outs[i].p, 0, y_bytes);                /* Y plane = 0 */
+			memset(outs[i].p + y_bytes, 128, outs[i].len - y_bytes); /* UV plane = 128 neutral */
+		} else {
+			memset(outs[i].p, 0, outs[i].len);
+		}
 	}
 
 	/* CAPTURE (H.264) buffers — encoder fills, we drain */
@@ -303,6 +328,10 @@ static inline uint8_t clamp_u8(int v)
  * two binaries produce visually-equivalent output for the same gamma/
  * contrast parameters. Applied to R, G, B in linear-RGB before RGB→YUV
  * (not on YUV-Y, which would over-lift mid-shadows). */
+/* 256-entry LUT: indexed by 8-bit linear bayer value (post-WB clamp),
+ * returns 8-bit gamma-encoded + tone-curved value. cam-stream takes the
+ * high 8 bits of each 10-bit pixel — the 2 LSBs would only matter for
+ * still photography (cam-snap keeps them via its 1024-entry LUT). */
 static uint8_t gamma_lut[256];
 
 /* Apply gamma_lut to 8 packed bytes (uint8x8_t) — scalar inner loop,
@@ -349,167 +378,188 @@ static inline uint8x8_t neon_mul_q8_sat(uint8x8_t v, uint16_t m)
 	return vqmovn_u16(vcombine_u16(lo16, hi16));
 }
 
-/* NEON bayer→NV12 with 2× downscale + center crop + WB + chroma saturation.
- * `sat_q8` is the YUV chroma multiplier in Q8.8 (256=neutral, 384=1.5× pop). */
-static void bayer_to_nv12(const uint8_t *bayer_packed, uint8_t *nv12,
-			  int bayer_w, int crop_x, int crop_y,
-			  int wb_r_q8, int wb_b_q8, int sat_q8)
+/* Per-thread context for the bilinear demosaic. Each worker owns a
+ * disjoint row range [oy_start, oy_end) of the NV12 output, so workers
+ * write to non-overlapping memory and need no mutex. */
+struct demosaic_ctx {
+	const uint8_t *bayer8;
+	int W, H;
+	int crop_x, crop_y;
+	uint8_t *yp, *uvp;
+	int out_w;
+	int oy_start, oy_end;
+	int wb_r_q8, wb_b_q8, sat_q8;
+};
+
+/* Bilinear demosaic + WB + gamma + RGB→NV12 for output rows
+ * [oy_start, oy_end). Bayer pattern is SGRBG (row even: G_top R; row
+ * odd: B G_bot). 1:1 mapping from binned bayer to NV12 — caller has
+ * already done the unpack pass into bayer8. */
+static void demosaic_rows(const struct demosaic_ctx *c)
 {
-	uint8_t *yp  = nv12;
-	uint8_t *uvp = nv12 + OUT_W * OUT_H;
+	const uint8_t *bayer8 = c->bayer8;
+	const int W       = c->W;
+	const int crop_x  = c->crop_x;
+	const int crop_y  = c->crop_y;
+	const int out_w   = c->out_w;
+	const int wb_r_q8 = c->wb_r_q8;
+	const int wb_b_q8 = c->wb_b_q8;
+	const int sat_q8  = c->sat_q8;
+	uint8_t *yp  = c->yp;
+	uint8_t *uvp = c->uvp;
 
-	/* Map a 20-byte pgAA span (4 groups × 5 bytes each, with byte-4 of
-	 * every group being the low-bit byte we drop) onto a contiguous
-	 * 16-byte vector of bayer pixels. Combined input vectors are:
-	 *   lo16 = bytes 0..15 (loaded with vld1q_u8(p))
-	 *   hi16 = bytes 4..19 (loaded with vld1q_u8(p+4))
-	 * vqtbl2q index 0..15 picks from lo16; 16..31 picks from hi16
-	 * (where hi16[n] = src(4+n)). */
-	static const uint8_t PGAA_IDX_BYTES[16] = {
-		 0,  1,  2,  3,
-		 5,  6,  7,  8,
-		10, 11, 12, 13,
-		15, 28, 29, 30,
-	};
-	uint8x16_t PGAA_IDX = vld1q_u8(PGAA_IDX_BYTES);
+	/* Direct read of bayer8; no clamping (center-crop keeps us in-bounds). */
+	#define BG(yy, xx) bayer8[(size_t)(yy) * W + (xx)]
+	#define WBG(v, wb_q8) gamma_lut[ ({ int _t = ((int)(v) * (wb_q8)) >> 8; _t > 255 ? 255 : _t; }) ]
+	#define G_GAMMA(v) gamma_lut[(v)]
+	#define RGB2Y(R,G,B) (uint8_t)(((77*(int)(R) + 150*(int)(G) + 29*(int)(B) + 128) >> 8))
 
-	const int row_stride = bayer_w * 5 / 4;
-	const uint16_t wbr = (uint16_t)wb_r_q8;
-	const uint16_t wbb = (uint16_t)wb_b_q8;
+	for (int oy = c->oy_start; oy < c->oy_end; oy += 2) {
+		int by = oy + crop_y;
+		uint8_t *y0_row = yp + (size_t)oy       * out_w;
+		uint8_t *y1_row = yp + (size_t)(oy + 1) * out_w;
+		uint8_t *uv_row = uvp + (size_t)(oy / 2) * out_w;
 
-	for (int oy = 0; oy < OUT_H; oy += 2) {
-		int mid_y0 = oy + crop_y;
-		int mid_y1 = mid_y0 + 1;
-		const uint8_t *t0 = bayer_packed + (size_t)(mid_y0 * 2)     * row_stride;
-		const uint8_t *b0 = bayer_packed + (size_t)(mid_y0 * 2 + 1) * row_stride;
-		const uint8_t *t1 = bayer_packed + (size_t)(mid_y1 * 2)     * row_stride;
-		const uint8_t *b1 = bayer_packed + (size_t)(mid_y1 * 2 + 1) * row_stride;
+		for (int ox = 0; ox < out_w; ox += 2) {
+			int bx = ox + crop_x;
 
-		uint8_t *y0_row = yp + (size_t)oy       * OUT_W;
-		uint8_t *y1_row = yp + (size_t)(oy + 1) * OUT_W;
-		uint8_t *uv_row = uvp + (size_t)(oy / 2) * OUT_W;
+			int r00 = (BG(by, bx-1) + BG(by, bx+1)) >> 1;
+			int g00 = BG(by, bx);
+			int b00 = (BG(by-1, bx) + BG(by+1, bx)) >> 1;
 
-		for (int ox = 0; ox < OUT_W; ox += 8) {
-			int start_g = (ox + crop_x) / 2;
-			const uint8_t *p_t0 = t0 + (size_t)start_g * 5;
-			const uint8_t *p_b0 = b0 + (size_t)start_g * 5;
-			const uint8_t *p_t1 = t1 + (size_t)start_g * 5;
-			const uint8_t *p_b1 = b1 + (size_t)start_g * 5;
+			int r01 = BG(by, bx+1);
+			int g01 = (BG(by, bx) + BG(by, bx+2) + BG(by-1, bx+1) + BG(by+1, bx+1)) >> 2;
+			int b01 = (BG(by-1, bx) + BG(by-1, bx+2) + BG(by+1, bx) + BG(by+1, bx+2)) >> 2;
 
-			/* Top row of 2×2 cell (GRGR…) for output row oy */
-			uint8x16x2_t in_t0 = {{ vld1q_u8(p_t0), vld1q_u8(p_t0 + 4) }};
-			uint8x16_t pix_t0 = vqtbl2q_u8(in_t0, PGAA_IDX);
-			uint8x8x2_t dt0 = vuzp_u8(vget_low_u8(pix_t0), vget_high_u8(pix_t0));
-			uint8x8_t G_t0 = dt0.val[0], R_0 = dt0.val[1];
+			int r10 = (BG(by, bx-1) + BG(by, bx+1) + BG(by+2, bx-1) + BG(by+2, bx+1)) >> 2;
+			int g10 = (BG(by+1, bx-1) + BG(by+1, bx+1) + BG(by, bx) + BG(by+2, bx)) >> 2;
+			int b10 = BG(by+1, bx);
 
-			/* Bot row of 2×2 cell (BGBG…) for output row oy */
-			uint8x16x2_t in_b0 = {{ vld1q_u8(p_b0), vld1q_u8(p_b0 + 4) }};
-			uint8x16_t pix_b0 = vqtbl2q_u8(in_b0, PGAA_IDX);
-			uint8x8x2_t db0 = vuzp_u8(vget_low_u8(pix_b0), vget_high_u8(pix_b0));
-			uint8x8_t B_0 = db0.val[0], G_b0 = db0.val[1];
+			int r11 = (BG(by, bx+1) + BG(by+2, bx+1)) >> 1;
+			int g11 = BG(by+1, bx+1);
+			int b11 = (BG(by+1, bx) + BG(by+1, bx+2)) >> 1;
 
-			/* Same for output row oy+1 */
-			uint8x16x2_t in_t1 = {{ vld1q_u8(p_t1), vld1q_u8(p_t1 + 4) }};
-			uint8x16_t pix_t1 = vqtbl2q_u8(in_t1, PGAA_IDX);
-			uint8x8x2_t dt1 = vuzp_u8(vget_low_u8(pix_t1), vget_high_u8(pix_t1));
-			uint8x8_t G_t1 = dt1.val[0], R_1 = dt1.val[1];
+			uint8_t Rg00 = WBG(r00, wb_r_q8), Gg00 = G_GAMMA(g00), Bg00 = WBG(b00, wb_b_q8);
+			uint8_t Rg01 = WBG(r01, wb_r_q8), Gg01 = G_GAMMA(g01), Bg01 = WBG(b01, wb_b_q8);
+			uint8_t Rg10 = WBG(r10, wb_r_q8), Gg10 = G_GAMMA(g10), Bg10 = WBG(b10, wb_b_q8);
+			uint8_t Rg11 = WBG(r11, wb_r_q8), Gg11 = G_GAMMA(g11), Bg11 = WBG(b11, wb_b_q8);
 
-			uint8x16x2_t in_b1 = {{ vld1q_u8(p_b1), vld1q_u8(p_b1 + 4) }};
-			uint8x16_t pix_b1 = vqtbl2q_u8(in_b1, PGAA_IDX);
-			uint8x8x2_t db1 = vuzp_u8(vget_low_u8(pix_b1), vget_high_u8(pix_b1));
-			uint8x8_t B_1 = db1.val[0], G_b1 = db1.val[1];
+			y0_row[ox  ] = RGB2Y(Rg00, Gg00, Bg00);
+			y0_row[ox+1] = RGB2Y(Rg01, Gg01, Bg01);
+			y1_row[ox  ] = RGB2Y(Rg10, Gg10, Bg10);
+			y1_row[ox+1] = RGB2Y(Rg11, Gg11, Bg11);
 
-			/* G_avg = (G_top + G_bot + 1) / 2 — rounding halving */
-			uint8x8_t G0 = vrhadd_u8(G_t0, G_b0);
-			uint8x8_t G1 = vrhadd_u8(G_t1, G_b1);
+			int Ravg = ((int)Rg00 + Rg01 + Rg10 + Rg11) >> 2;
+			int Gavg = ((int)Gg00 + Gg01 + Gg10 + Gg11) >> 2;
+			int Bavg = ((int)Bg00 + Bg01 + Bg10 + Bg11) >> 2;
 
-			/* White-balance R and B (Q8.8 multiply, saturating narrow) */
-			uint8x8_t R0_wb = neon_mul_q8_sat(R_0, wbr);
-			uint8x8_t B0_wb = neon_mul_q8_sat(B_0, wbb);
-			uint8x8_t R1_wb = neon_mul_q8_sat(R_1, wbr);
-			uint8x8_t B1_wb = neon_mul_q8_sat(B_1, wbb);
-
-			/* SATURATION in linear-RGB BEFORE gamma — matches
-			 * cam-snap. Compute per-row Y (Rec.601) then pull
-			 * each channel toward/away from Y by sat_q8/256. */
-			uint16x8_t y0_lin_acc = vdupq_n_u16(0);
-			y0_lin_acc = vmlaq_n_u16(y0_lin_acc, vmovl_u8(R0_wb), 77);
-			y0_lin_acc = vmlaq_n_u16(y0_lin_acc, vmovl_u8(G0),    150);
-			y0_lin_acc = vmlaq_n_u16(y0_lin_acc, vmovl_u8(B0_wb), 29);
-			uint8x8_t Y0_lin = vshrn_n_u16(y0_lin_acc, 8);
-
-			uint16x8_t y1_lin_acc = vdupq_n_u16(0);
-			y1_lin_acc = vmlaq_n_u16(y1_lin_acc, vmovl_u8(R1_wb), 77);
-			y1_lin_acc = vmlaq_n_u16(y1_lin_acc, vmovl_u8(G1),    150);
-			y1_lin_acc = vmlaq_n_u16(y1_lin_acc, vmovl_u8(B1_wb), 29);
-			uint8x8_t Y1_lin = vshrn_n_u16(y1_lin_acc, 8);
-
-			R0_wb = saturate_channel(R0_wb, Y0_lin, sat_q8);
-			G0    = saturate_channel(G0,    Y0_lin, sat_q8);
-			B0_wb = saturate_channel(B0_wb, Y0_lin, sat_q8);
-			R1_wb = saturate_channel(R1_wb, Y1_lin, sat_q8);
-			G1    = saturate_channel(G1,    Y1_lin, sat_q8);
-			B1_wb = saturate_channel(B1_wb, Y1_lin, sat_q8);
-
-			/* GAMMA + S-curve LUT on the saturated R, G, B. Same
-			 * lookup table cam-snap applies after its sat step. */
-			R0_wb = apply_lut_x8(R0_wb, gamma_lut);
-			G0    = apply_lut_x8(G0,    gamma_lut);
-			B0_wb = apply_lut_x8(B0_wb, gamma_lut);
-			R1_wb = apply_lut_x8(R1_wb, gamma_lut);
-			G1    = apply_lut_x8(G1,    gamma_lut);
-			B1_wb = apply_lut_x8(B1_wb, gamma_lut);
-
-			/* Y = (77R + 150G + 29B + 128) >> 8 — now on gamma-
-			 * encoded R, G, B so the Y values match cam-snap. */
-			uint16x8_t y0a = vdupq_n_u16(128);
-			y0a = vmlaq_n_u16(y0a, vmovl_u8(R0_wb), 77);
-			y0a = vmlaq_n_u16(y0a, vmovl_u8(G0),    150);
-			y0a = vmlaq_n_u16(y0a, vmovl_u8(B0_wb), 29);
-			vst1_u8(y0_row + ox, vshrn_n_u16(y0a, 8));
-
-			uint16x8_t y1a = vdupq_n_u16(128);
-			y1a = vmlaq_n_u16(y1a, vmovl_u8(R1_wb), 77);
-			y1a = vmlaq_n_u16(y1a, vmovl_u8(G1),    150);
-			y1a = vmlaq_n_u16(y1a, vmovl_u8(B1_wb), 29);
-			vst1_u8(y1_row + ox, vshrn_n_u16(y1a, 8));
-
-			/* UV: average 2×2 RGB blocks (horizontal-pair sums then
-			 * vertical add, divide by 4). 8 columns × 2 rows → 4 UV
-			 * pairs. Work in signed 16-bit since U/V need negation. */
-			uint16x4_t R0p = vpaddl_u8(R0_wb);
-			uint16x4_t G0p = vpaddl_u8(G0);
-			uint16x4_t B0p = vpaddl_u8(B0_wb);
-			uint16x4_t R1p = vpaddl_u8(R1_wb);
-			uint16x4_t G1p = vpaddl_u8(G1);
-			uint16x4_t B1p = vpaddl_u8(B1_wb);
-
-			int16x4_t Ravg = vreinterpret_s16_u16(vshr_n_u16(vadd_u16(R0p, R1p), 2));
-			int16x4_t Gavg = vreinterpret_s16_u16(vshr_n_u16(vadd_u16(G0p, G1p), 2));
-			int16x4_t Bavg = vreinterpret_s16_u16(vshr_n_u16(vadd_u16(B0p, B1p), 2));
-
-			/* U = ((-43R - 85G + 128B) >> 8) + 128 */
-			int16x4_t Uacc = vmul_n_s16(Ravg, -43);
-			Uacc = vmla_n_s16(Uacc, Gavg, -85);
-			Uacc = vmla_n_s16(Uacc, Bavg, 128);
-			int16x4_t Uval = vadd_s16(vshr_n_s16(Uacc, 8), vdup_n_s16(128));
-
-			/* V = ((128R - 107G - 21B) >> 8) + 128 — chroma sat
-			 * was already applied in linear-RGB above, so we
-			 * skip the YUV-chroma stretch that earlier versions
-			 * did here. */
-			int16x4_t Vacc = vmul_n_s16(Ravg, 128);
-			Vacc = vmla_n_s16(Vacc, Gavg, -107);
-			Vacc = vmla_n_s16(Vacc, Bavg, -21);
-			int16x4_t Vval = vadd_s16(vshr_n_s16(Vacc, 8), vdup_n_s16(128));
-
-			/* Saturate to u8 and interleave U,V → 8 bytes */
-			uint8x8_t U8 = vqmovun_s16(vcombine_s16(Uval, vdup_n_s16(0)));
-			uint8x8_t V8 = vqmovun_s16(vcombine_s16(Vval, vdup_n_s16(0)));
-			uint8x8x2_t uvz = vzip_u8(U8, V8);
-			vst1_u8(uv_row + ox, uvz.val[0]);
+			int u = ((-43*Ravg - 85*Gavg + 128*Bavg) >> 8) + 128;
+			int v = (( 128*Ravg - 107*Gavg - 21*Bavg) >> 8) + 128;
+			u = ((u - 128) * sat_q8 >> 8) + 128;
+			v = ((v - 128) * sat_q8 >> 8) + 128;
+			if (u < 0) u = 0; else if (u > 255) u = 255;
+			if (v < 0) v = 0; else if (v > 255) v = 255;
+			uv_row[ox  ] = (uint8_t)u;
+			uv_row[ox+1] = (uint8_t)v;
 		}
 	}
+
+	#undef BG
+	#undef WBG
+	#undef G_GAMMA
+	#undef RGB2Y
+}
+
+static void *demosaic_worker(void *arg)
+{
+	demosaic_rows((const struct demosaic_ctx *)arg);
+	return NULL;
+}
+
+/* Number of worker threads. msm8953 has 4 Cortex-A53 cores; each chunk
+ * of out_h/N rows is independent (no shared writes), so we get close to
+ * linear speedup until DRAM contention takes over. */
+#define DEMOSAIC_THREADS 4
+
+/* Bilinear demosaic + WB + saturation + gamma + RGB→NV12, parallelized.
+ * Designed for 2×2-binned sensor output; each binned bayer pixel is
+ * already a 4-photodiode average. Caller passes the bayer's actual
+ * (V4L2-reported) row stride so we honor the driver's row padding.
+ *
+ * One thread does the 5-bytes-to-4-pixels unpack pass over the whole
+ * bayer buffer (fast, memory-bandwidth-bound), then DEMOSAIC_THREADS
+ * workers run the bilinear+color step over disjoint output row
+ * ranges. */
+static void bayer_to_nv12(const uint8_t *bayer_packed, uint8_t *nv12,
+			  int bayer_w, int bayer_h,
+			  int bayer_stride_packed,
+			  int out_w, int out_h,
+			  int wb_r_q8, int wb_b_q8, int sat_q8)
+{
+	const int W = bayer_w;
+	const int H = bayer_h;
+	const int crop_x = ((bayer_w - out_w) / 2) & ~1;
+	const int crop_y = ((bayer_h - out_h) / 2) & ~1;
+	uint8_t *yp  = nv12;
+	uint8_t *uvp = nv12 + (size_t)out_w * out_h;
+
+	/* Unpack SGRBG10P → 8-bit linear bayer, kept across frames. */
+	static uint8_t *bayer8 = NULL;
+	static size_t bayer8_cap = 0;
+	size_t need = (size_t)W * H;
+	if (need > bayer8_cap) {
+		free(bayer8);
+		bayer8 = (uint8_t *)malloc(need);
+		if (!bayer8) die("bayer8 malloc: %s", strerror(errno));
+		bayer8_cap = need;
+	}
+	{
+		const int row_stride_p = bayer_stride_packed;
+		for (int y = 0; y < H; y++) {
+			const uint8_t *p = bayer_packed + (size_t)y * row_stride_p;
+			uint8_t *q = bayer8 + (size_t)y * W;
+			for (int x = 0; x < W; x += 4, p += 5) {
+				q[x+0] = p[0];
+				q[x+1] = p[1];
+				q[x+2] = p[2];
+				q[x+3] = p[3];
+			}
+		}
+	}
+
+	/* Build N contexts, one per worker. Each gets out_h/N rows. */
+	struct demosaic_ctx ctx[DEMOSAIC_THREADS];
+	int chunk = (out_h / DEMOSAIC_THREADS) & ~1;  /* keep chunk size even */
+	for (int t = 0; t < DEMOSAIC_THREADS; t++) {
+		ctx[t] = (struct demosaic_ctx){
+			.bayer8  = bayer8,
+			.W       = W,
+			.H       = H,
+			.crop_x  = crop_x,
+			.crop_y  = crop_y,
+			.yp      = yp,
+			.uvp     = uvp,
+			.out_w   = out_w,
+			.oy_start = t * chunk,
+			.oy_end   = (t == DEMOSAIC_THREADS - 1) ? out_h : (t + 1) * chunk,
+			.wb_r_q8 = wb_r_q8,
+			.wb_b_q8 = wb_b_q8,
+			.sat_q8  = sat_q8,
+		};
+	}
+
+	/* Spawn N-1 workers; do the first chunk on the calling thread. */
+	pthread_t workers[DEMOSAIC_THREADS - 1];
+	for (int t = 1; t < DEMOSAIC_THREADS; t++) {
+		if (pthread_create(&workers[t-1], NULL, demosaic_worker, &ctx[t]) != 0) {
+			/* Fall back to running it inline on a thread-create failure. */
+			demosaic_rows(&ctx[t]);
+			workers[t-1] = 0;
+		}
+	}
+	demosaic_rows(&ctx[0]);
+	for (int t = 0; t < DEMOSAIC_THREADS - 1; t++)
+		if (workers[t]) pthread_join(workers[t], NULL);
 }
 
 /* ----------------------------------------------------------------------
@@ -529,7 +579,8 @@ static double now_s(void)
  * positions in under a second. */
 static double af_score_pgAA(const uint8_t *bayer_packed, int bayer_w, int bayer_h)
 {
-	const int row_stride = bayer_w * 5 / 4;
+	/* V4L2 pads packed-bayer rows to 8-byte multiples; honor that. */
+	const int row_stride = ((bayer_w * 5 / 4) + 7) & ~7;
 	int cw = bayer_w > 1024 ? 1024 : bayer_w;
 	int ch = bayer_h > 768  ? 768  : bayer_h;
 	int x0 = (bayer_w - cw) / 2; if (x0 & 1) x0--;
@@ -621,15 +672,15 @@ int main(int argc, char **argv)
 	/* Per-camera config; default is front. --camera rear flips to rear. */
 	const char *cam_dev    = "/dev/video1";
 	const char *cam_subdev = "/dev/v4l-subdev18";
-	int cam_w   = FRONT_BAYER_W;
-	int cam_h   = FRONT_BAYER_H;
-	int crop_x  = FRONT_CROP_X;
-	int crop_y  = FRONT_CROP_Y;
-	/* Per-camera defaults; front max exposure ~65k, rear ~3172 lines.
-	 * Picking values that keep the sensor at 30 fps and look reasonable
-	 * indoors. Override with --exposure / --gain. */
-	int exposure = 5000, gain = 384;
+	int cam_w   = FRONT_BAYER_W_BINNED;
+	int cam_h   = FRONT_BAYER_H_BINNED;
+	/* Per-camera defaults; binning sums 4 photodiodes per output pixel,
+	 * so the linear signal is ~4× brighter than at full res. Defaults
+	 * here are tuned for binned mode (front). Override with
+	 * --exposure / --gain. */
+	int exposure = 1250, gain = 384;
 	int do_autofocus = 0;        /* one-shot AF before streaming (rear only) */
+	int focus_pos = 0;           /* DW9800W DAC value, 0=infinity .. 1023=macro */
 	int bitrate = 0;  /* 0 = pick per-camera default after argv parse */
 	/* cam-stream uses _STREAM variants (lower R/B than cam-snap's MHC-
 	 * tuned defaults) to compensate for the bilinear demosaic. */
@@ -657,16 +708,25 @@ int main(int argc, char **argv)
 			if (!strcmp(c, "rear")) {
 				cam_dev    = "/dev/video0";
 				cam_subdev = "/dev/v4l-subdev16";
-				cam_w  = REAR_BAYER_W;
-				cam_h  = REAR_BAYER_H;
-				crop_x = REAR_CROP_X;
-				crop_y = REAR_CROP_Y;
-				/* Rear's max exposure is ~3172 lines; pick something
-				 * a little under that for 30 fps headroom. */
-				exposure = 2500;
+				cam_w  = REAR_BAYER_W_BINNED;
+				cam_h  = REAR_BAYER_H_BINNED;
+				/* Rear binned mode max-exposure scaling: ybin reduces
+				 * frame time so the exposure range shrinks ~half vs
+				 * full-res; 1250 lines stays in range and matches
+				 * typical indoor brightness with binning's 4× gain. */
+				exposure = 1250;
 				wb_r_q8 = CAM_WB_REAR_R_Q8_STREAM;
 				wb_b_q8 = CAM_WB_REAR_B_Q8_STREAM;
-				do_autofocus = 1;
+				/* Skip the AF sweep on rear by default — the per-frame
+				 * Laplacian score's signal-to-noise ratio is too low for
+				 * reliable peak detection in binned-bayer mode (all 16
+				 * probe positions report scores within ~5% of each
+				 * other, so the picked peak is essentially noise — and
+				 * lands near macro). Default to lens-at-infinity which
+				 * is right for typical room/outdoor framing. Override
+				 * with --focus N (0=∞, 1023=macro) or --autofocus to
+				 * run the sweep. */
+				focus_pos = 0;
 				/* Rear sustains ~30 fps natively */
 				target_fps = 30;
 			} else if (!strcmp(c, "front")) {
@@ -690,6 +750,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--fps") && i+1 < argc) target_fps = atoi(argv[++i]);
 		else if (!strcmp(a, "--autofocus")) do_autofocus = 1;
 		else if (!strcmp(a, "--no-autofocus")) do_autofocus = 0;
+		else if (!strcmp(a, "--focus") && i+1 < argc) focus_pos = atoi(argv[++i]);
 		else if (!strcmp(a, "--saturation") && i+1 < argc) {
 			sat_q8 = (int)(atof(argv[++i]) * 256);
 		}
@@ -721,6 +782,23 @@ int main(int argc, char **argv)
 		bitrate = (strcmp(cam_dev, "/dev/video1") == 0) ? 2000000 : 4000000;
 
 	cam_pipeline_build_lut(gamma_lut, 256, gamma_val, contrast, brightness);
+
+	/* Reconfigure the CAMSS media graph for the binned sensor mode.
+	 * fp3-cam-setup is idempotent and fast (~50 ms of media-ctl calls).
+	 * Running it here means cam-stream always gets the geometry it
+	 * expects, regardless of what cam-snap or the Elixir manager
+	 * left the subdevs set to. */
+	{
+		const char *which = (strcmp(cam_dev, "/dev/video0") == 0) ? "rear" : "front";
+		char setup_cmd[128];
+		/* Redirect setup output to stderr so it doesn't pollute the
+		 * NV12/H.264 stream on stdout in --out-nv12 mode. */
+		snprintf(setup_cmd, sizeof(setup_cmd),
+			 "/usr/bin/fp3-cam-setup --binned %s 1>&2", which);
+		int rc = system(setup_cmd);
+		if (rc != 0)
+			fprintf(stderr, "cam-stream: fp3-cam-setup returned %d (continuing)\n", rc);
+	}
 
 	signal(SIGINT, on_sigint);
 	signal(SIGPIPE, SIG_IGN);
@@ -758,16 +836,35 @@ int main(int argc, char **argv)
 	struct buf enc_out_bufs[ENC_OUT_BUFS];
 	struct buf enc_cap_bufs[ENC_CAP_BUFS];
 
+	int cap_bytesperline = 0;
 	int cap_fd = cap_open_and_setup(cam_dev, cam_subdev, cam_w, cam_h,
-					exposure, gain, cap_bufs);
+					exposure, gain, cap_bufs,
+					&cap_bytesperline);
 
-	/* Run one-shot autofocus before the encoder is up. Sweeps 16 lens
-	 * positions in ~1 s and picks the sharpest. Rear camera only — front
-	 * has no VCM. */
-	if (do_autofocus) {
-		const char *lens_dev = "/dev/v4l-subdev17";
-		fprintf(stderr, "cam-stream: one-shot AF sweep…\n");
-		do_autofocus_priv(cap_fd, cap_bufs, cam_w, cam_h, lens_dev);
+	/* Rear lens-position policy:
+	 *   - --autofocus     → run the 16-position sweep (noisy in binned
+	 *                       mode; off by default)
+	 *   - --focus N       → use DAC value N directly (0=∞ .. 1023=macro)
+	 *   - neither flag    → DAC = 0 (infinity), good default for normal
+	 *                       indoor / outdoor framing
+	 * Front cam has no VCM so the path is skipped. */
+	const char *lens_dev = "/dev/v4l-subdev17";
+	if (strcmp(cam_dev, "/dev/video0") == 0) {
+		if (do_autofocus) {
+			fprintf(stderr, "cam-stream: one-shot AF sweep…\n");
+			do_autofocus_priv(cap_fd, cap_bufs, cam_w, cam_h, lens_dev);
+		} else {
+			int lfd = open(lens_dev, O_RDWR);
+			if (lfd >= 0) {
+				struct v4l2_control c = {
+					.id = V4L2_CID_FOCUS_ABSOLUTE,
+					.value = focus_pos < 0 ? 0 : (focus_pos > 1023 ? 1023 : focus_pos),
+				};
+				xioctl(lfd, VIDIOC_S_CTRL, &c);
+				close(lfd);
+				fprintf(stderr, "cam-stream: lens DAC=%d\n", c.value);
+			}
+		}
 	}
 
 	int enc_fd = -1;
@@ -795,7 +892,8 @@ int main(int argc, char **argv)
 			if (pr <= 0) continue;
 			if (xioctl(cap_fd, VIDIOC_DQBUF, &cb) < 0) continue;
 			bayer_to_nv12(cap_bufs[cb.index].p, nv12,
-				      cam_w, crop_x, crop_y,
+				      cam_w, cam_h, cap_bytesperline,
+				      OUT_W, OUT_H,
 				      wb_r_q8, wb_b_q8, sat_q8);
 			size_t left = (size_t)OUT_W * OUT_H * 3 / 2;
 			uint8_t *p = nv12;
@@ -956,7 +1054,8 @@ int main(int argc, char **argv)
 
 			bayer_to_nv12(cap_bufs[cb.index].p,
 				      enc_out_bufs[oi].p,
-				      cam_w, crop_x, crop_y,
+				      cam_w, cam_h, cap_bytesperline,
+				      OUT_W, OUT_H,
 				      wb_r_q8, wb_b_q8, sat_q8);
 
 			/* Queue NV12 to encoder.

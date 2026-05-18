@@ -789,6 +789,17 @@ int main(int argc, char **argv)
 	if (!dev || !out || !width || !height) { fputs(USAGE, stderr); return 1; }
 	if (width % 4 != 0) die("width must be a multiple of 4");
 
+	/* Ensure the CAMSS pipeline is set to full sensor resolution. Needed
+	 * because cam-stream may have left the subdevs in binned mode. */
+	if (camera_preset) {
+		char setup_cmd[128];
+		snprintf(setup_cmd, sizeof(setup_cmd),
+			 "/usr/bin/fp3-cam-setup %s 1>&2", camera_preset);
+		int rc = system(setup_cmd);
+		if (rc != 0)
+			fprintf(stderr, "cam-snap: fp3-cam-setup returned %d (continuing)\n", rc);
+	}
+
 	signal(SIGPIPE, SIG_IGN);
 	build_gamma_lut(gamma_val, contrast);
 	if (lsc_amount < 0)

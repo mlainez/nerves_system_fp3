@@ -9,7 +9,7 @@
 #
 ################################################################################
 
-FP3_CAMERA_UTILS_VERSION = 0.2.0
+FP3_CAMERA_UTILS_VERSION = 0.6.1
 FP3_CAMERA_UTILS_SITE = $(NERVES_DEFCONFIG_DIR)/packages/fp3-camera-utils/src
 FP3_CAMERA_UTILS_SITE_METHOD = local
 FP3_CAMERA_UTILS_LICENSE = MIT
@@ -27,7 +27,7 @@ define FP3_CAMERA_UTILS_BUILD_CMDS
 		-I$(STAGING_DIR)/usr/include \
 		-o $(@D)/cam-stream $(@D)/cam-stream.c \
 		-L$(STAGING_DIR)/usr/lib \
-		-lm
+		-lm -lpthread
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
 		-o $(@D)/cam-grab $(@D)/cam-grab.c
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
