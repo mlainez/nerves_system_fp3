@@ -352,6 +352,7 @@ struct ctrl_state {
 };
 static struct ctrl_state ctrl;
 static int control_port = 0;   /* 0 = no control socket */
+static const char *cam_subdev_path = NULL;   /* set in main() for exposure/gain ctrl */
 
 /* Apply gamma_lut to 8 packed bytes (uint8x8_t) — scalar inner loop,
  * fast enough since the LUT fits in L1 (256B). Used per R/G/B vector. */
@@ -597,9 +598,28 @@ static void bayer_to_nv12(const uint8_t *bayer_packed, uint8_t *nv12,
  *
  * Unknown commands are silently ignored. The thread runs for the
  * lifetime of cam-stream and re-accepts on disconnect. */
+/* Push a sensor-subdev control (exposure / analogue gain). These bypass
+ * the per-frame pipeline state — they reprogram the sensor directly. */
+static void set_sensor_ctrl(int v4l2_cid, int value, const char *label)
+{
+	if (!cam_subdev_path) return;
+	int fd = open(cam_subdev_path, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "cam-stream: open %s for %s: %s\n",
+			cam_subdev_path, label, strerror(errno));
+		return;
+	}
+	struct v4l2_control c = { .id = v4l2_cid, .value = value };
+	if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0)
+		fprintf(stderr, "cam-stream: S_CTRL %s=%d failed: %s\n",
+			label, value, strerror(errno));
+	close(fd);
+}
+
 static void apply_ctrl_cmd(const char *line, int fd_out)
 {
 	float a, b, c;
+	int  i;
 	pthread_mutex_lock(&ctrl.mu);
 	if (sscanf(line, " wb %f %f %f", &a, &b, &c) == 3) {
 		ctrl.wb_r_q8 = (int)(a * 256.0f);
@@ -616,6 +636,14 @@ static void apply_ctrl_cmd(const char *line, int fd_out)
 	} else if (sscanf(line, " brightness %f", &a) == 1) {
 		ctrl.brightness = a;
 		ctrl.rebuild_lut = 1;
+	} else if (sscanf(line, " exposure %d", &i) == 1) {
+		pthread_mutex_unlock(&ctrl.mu);
+		set_sensor_ctrl(V4L2_CID_EXPOSURE, i, "exposure");
+		return;
+	} else if (sscanf(line, " gain %d", &i) == 1) {
+		pthread_mutex_unlock(&ctrl.mu);
+		set_sensor_ctrl(V4L2_CID_ANALOGUE_GAIN, i, "gain");
+		return;
 	} else if (strncmp(line, "show", 4) == 0) {
 		char buf[256];
 		int n = snprintf(buf, sizeof(buf),
@@ -915,6 +943,7 @@ int main(int argc, char **argv)
 	ctrl.brightness = brightness;
 	ctrl.rebuild_lut = 0;
 	if (control_port == 0 && listen_port > 0) control_port = listen_port + 1;
+	cam_subdev_path = cam_subdev;
 	if (control_port > 0) {
 		pthread_t ctrl_th;
 		pthread_create(&ctrl_th, NULL, control_thread, NULL);
