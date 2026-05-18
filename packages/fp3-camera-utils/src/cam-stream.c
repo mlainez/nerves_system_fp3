@@ -56,9 +56,15 @@
 #define OUT_W   1920
 #define OUT_H   1080
 
-#define CAP_BUFS     4
-#define ENC_OUT_BUFS 4
-#define ENC_CAP_BUFS 6
+/* Sized so two concurrent cam-stream instances (front + rear) don't
+ * starve the CAMSS write-master IRQs. With CAP_BUFS=4 the kernel was
+ * logging "qcom-camss: Missing ready buf 0 5!" whenever Venus took a
+ * jitter-spike encoding the other feed, dropping or corrupting rear
+ * sensor frames (visible noise in mpv). Doubling each ring gives the
+ * userspace main loop ~270 ms of slack at 30 fps instead of ~133 ms. */
+#define CAP_BUFS     8
+#define ENC_OUT_BUFS 6
+#define ENC_CAP_BUFS 8
 
 #define die(...) do { fprintf(stderr, "cam-stream: " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
 
@@ -719,6 +725,71 @@ static void *control_thread(void *arg)
 }
 
 /* ----------------------------------------------------------------------
+ * Encoder drain (Venus CAPTURE + TCP write) — runs on its own thread so
+ * the sensor side never blocks on Venus latency or a slow mpv client.
+ * --------------------------------------------------------------------*/
+
+struct drain_ctx {
+	int enc_fd;
+	int sink_fd;
+	struct buf *enc_cap_bufs;
+	int n_cap_bufs;
+	uint64_t *out_total;
+};
+
+static void *drain_thread(void *arg)
+{
+	struct drain_ctx *c = arg;
+
+	while (running) {
+		struct pollfd pf = { .fd = c->enc_fd, .events = POLLIN };
+		int pr = poll(&pf, 1, 500);
+		if (pr <= 0) continue;
+		if (!(pf.revents & POLLIN)) continue;
+
+		struct v4l2_plane pl = {0};
+		struct v4l2_buffer b = {
+			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+			.memory = V4L2_MEMORY_MMAP,
+			.length = 1,
+			.m.planes = &pl,
+		};
+		while (xioctl(c->enc_fd, VIDIOC_DQBUF, &b) == 0) {
+			size_t n = pl.bytesused;
+			if (n > 0) {
+				const uint8_t *p = c->enc_cap_bufs[b.index].p;
+				size_t left = n;
+				while (left > 0 && running) {
+					ssize_t w = write(c->sink_fd, p, left);
+					if (w < 0) {
+						if (errno == EINTR) continue;
+						if (errno == EPIPE) {
+							fprintf(stderr, "client disconnected\n");
+							running = 0;
+							break;
+						}
+						fprintf(stderr, "write: %s\n", strerror(errno));
+						running = 0;
+						break;
+					}
+					p += w; left -= w;
+				}
+				if (c->out_total) *c->out_total += n;
+			}
+			memset(&pl, 0, sizeof(pl));
+			xioctl(c->enc_fd, VIDIOC_QBUF, &b);
+			memset(&pl, 0, sizeof(pl));
+			b = (struct v4l2_buffer){
+				.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+				.memory = V4L2_MEMORY_MMAP,
+				.length = 1, .m.planes = &pl
+			};
+		}
+	}
+	return NULL;
+}
+
+/* ----------------------------------------------------------------------
  * Main
  * --------------------------------------------------------------------*/
 
@@ -1122,7 +1193,20 @@ int main(int argc, char **argv)
 
 	double t0 = now_s();
 	int frame_count = 0;
-	int out_total = 0;
+	uint64_t out_total = 0;
+	/* Spawn the encode-drain thread that owns Venus CAPTURE + TCP write.
+	 * Decoupling it from the capture/encode-submit loop is what lets the
+	 * sensor side stay fed when Venus is contended serving the other
+	 * cam-stream instance, or when mpv is briefly slow. */
+	struct drain_ctx dctx = {
+		.enc_fd = enc_fd,
+		.sink_fd = sink_fd,
+		.enc_cap_bufs = enc_cap_bufs,
+		.n_cap_bufs = ENC_CAP_BUFS,
+		.out_total = &out_total,
+	};
+	pthread_t drain_th;
+	pthread_create(&drain_th, NULL, drain_thread, &dctx);
 
 	/* Frame pacer: drop sensor frames that arrive faster than target_fps,
 	 * so the encoder + downstream see exactly 1000/N ms inter-arrival.
@@ -1145,7 +1229,7 @@ int main(int argc, char **argv)
 	while (running && (max_frames == 0 || frame_count < max_frames)) {
 		struct pollfd pfds[2] = {
 			{ .fd = cap_fd, .events = POLLIN },
-			{ .fd = enc_fd, .events = POLLIN | POLLOUT },
+			{ .fd = enc_fd, .events = POLLOUT },
 		};
 		int pr = poll(pfds, 2, 1000);
 		if (pr <= 0) {
@@ -1154,48 +1238,8 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		/* Drain encoder bitstream first so we don't backpressure */
-		if (pfds[1].revents & POLLIN) {
-			struct v4l2_plane pl = {0};
-			struct v4l2_buffer b = {0};
-			b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-			b.memory = V4L2_MEMORY_MMAP;
-			b.length = 1;
-			b.m.planes = &pl;
-			while (xioctl(enc_fd, VIDIOC_DQBUF, &b) == 0) {
-				size_t n = pl.bytesused;
-				if (n > 0) {
-					const uint8_t *p = enc_cap_bufs[b.index].p;
-					size_t left = n;
-					while (left > 0 && running) {
-						ssize_t w = write(sink_fd, p, left);
-						if (w < 0) {
-							if (errno == EINTR) continue;
-							if (errno == EPIPE) {
-								fprintf(stderr, "client disconnected\n");
-								running = 0;
-								break;
-							}
-							fprintf(stderr, "write: %s\n", strerror(errno));
-							running = 0;
-							break;
-						}
-						p += w; left -= w;
-					}
-					out_total += n;
-				}
-				memset(&pl, 0, sizeof(pl));
-				xioctl(enc_fd, VIDIOC_QBUF, &b);
-				memset(&pl, 0, sizeof(pl));
-				b = (struct v4l2_buffer){
-					.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-					.memory = V4L2_MEMORY_MMAP,
-					.length = 1, .m.planes = &pl
-				};
-			}
-		}
-
-		/* Reclaim finished enc OUTPUT buffers */
+		/* Reclaim finished enc OUTPUT buffers (Venus done reading the
+		 * NV12 we queued). The drain thread owns the CAPTURE side. */
 		if (pfds[1].revents & POLLOUT) {
 			struct v4l2_plane pl = {0};
 			struct v4l2_buffer b = {0};
@@ -1301,12 +1345,15 @@ int main(int argc, char **argv)
 			if (frame_count % 30 == 0) {
 				double elapsed = now_s() - t0;
 				fprintf(stderr,
-					"\rframes=%d  fps=%.1f  out=%d KB  ",
+					"\rframes=%d  fps=%.1f  out=%llu KB  ",
 					frame_count, frame_count / elapsed,
-					out_total / 1024);
+					(unsigned long long)(out_total / 1024));
 			}
 		}
 	}
+
+	running = 0;
+	pthread_join(drain_th, NULL);
 
 	int t;
 	t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; xioctl(cap_fd, VIDIOC_STREAMOFF, &t);
@@ -1315,7 +1362,8 @@ int main(int argc, char **argv)
 	close(cap_fd);
 	close(enc_fd);
 	fprintf(stderr,
-		"\ncam-stream: done. frames=%d, %.1f fps avg, %d KB output\n",
-		frame_count, frame_count / (now_s() - t0), out_total / 1024);
+		"\ncam-stream: done. frames=%d, %.1f fps avg, %llu KB output\n",
+		frame_count, frame_count / (now_s() - t0),
+		(unsigned long long)(out_total / 1024));
 	return 0;
 }
