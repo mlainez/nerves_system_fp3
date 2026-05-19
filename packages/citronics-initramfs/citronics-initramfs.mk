@@ -108,6 +108,43 @@ define CITRONICS_INITRAMFS_INSTALL_TARGET_CMDS
 		ln -sf busybox telnetd && \
 		ln -sf busybox getty
 
+	# Bake the Adreno GPU firmware into the initramfs. The in-tree
+	# msm DRM driver probes 1c00000.gpu at ~2.7s, BEFORE pivot_root
+	# from the initramfs into the squashfs rootfs. adreno_request_fw()
+	# uses request_firmware_direct() — no wait, no retry — so if the
+	# files aren't visible at probe time, the GPU is dead for the
+	# rest of the boot.
+	#
+	# Generic across Adreno generations:
+	#   * a3xx on FP2 (Adreno 305): a300_pm4.fw, a300_pfp.fw, a300_zap.*
+	#   * a5xx on FP3+ (Adreno 506): a530_pm4.fw, a530_pfp.fw,
+	#     a530v3_gpmu.fw2, a506_zap.* (under the DT firmware-name
+	#     subpath qcom/<soc>/<vendor>/<board>/)
+	#   * a6xx / a7xx future targets: a*_sqe.fw, a*_gmu.bin
+	#
+	# Pick up whatever's installed under target/lib/firmware/qcom/
+	# matching the Adreno-firmware naming patterns. Skip the modem /
+	# ADSP / WCNSS / Venus blobs — those are loaded by remoteproc
+	# after pivot_root and don't need to be in the initramfs.
+	if [ -d "$(TARGET_DIR)/lib/firmware/qcom" ]; then \
+		mkdir -p "$(CITRONICS_INITRAMFS_STAGING)/lib/firmware/qcom"; \
+		cd "$(TARGET_DIR)/lib/firmware/qcom" && \
+		find . \( -name 'a*_pm4.fw*' \
+		       -o -name 'a*_pfp.fw*' \
+		       -o -name 'a*_sqe.fw*' \
+		       -o -name 'a*_gpmu.fw*' \
+		       -o -name 'a*_gmu.bin' \
+		       -o -name 'a*_zap.mdt' \
+		       -o -name 'a*_zap.mbn' \
+		       -o -name 'a*_zap.elf' \
+		       -o -name 'a*_zap.b*' \) -print | \
+		while read f; do \
+			dest="$(CITRONICS_INITRAMFS_STAGING)/lib/firmware/qcom/$$f"; \
+			mkdir -p "$$(dirname "$$dest")"; \
+			cp -aL "$$f" "$$dest"; \
+		done; \
+	fi
+
 	# The upstream init uses busybox's `mdev` for device-node hotplug,
 	# not full udev — so we deliberately do not copy /usr/lib/udev.
 	# Pulling it in dragged in ~19 MiB of libcrypto via udev's
