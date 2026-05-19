@@ -1,35 +1,36 @@
 Subject: freedreno/a5xx: implement emit_intrinsic_load/store_global_ir3
 
-The Freedreno IR3 compiler's funcs table for a4xx/a5xx
-(ir3_a4xx_funcs) left .emit_intrinsic_load_global_ir3 and
-.emit_intrinsic_store_global_ir3 as NULL. OpenGL ES 3.1 shaders use
-SSBO intrinsics (load_ssbo/store_ssbo, which a4xx_funcs implements)
-so the gap was harmless — but Rusticl-compiled OpenCL kernels emit
-nir_intrinsic_load_global_ir3 / nir_intrinsic_store_global_ir3 for
-__global pointer accesses, and ir3_compiler_nir.c's emit_intrinsic
-dereferences the NULL function pointer at line 2798:
+ir3_compiler_nir.c's emit_intrinsic() at line 2798 dereferences
+ctx->funcs->emit_intrinsic_load_global_ir3 for any kernel that emits
+nir_intrinsic_load_global_ir3. The funcs table for a4xx/a5xx
+(ir3_a4xx_funcs in ir3_a4xx.c) leaves that field NULL, so every
+Rusticl-compiled OpenCL kernel that touches a __global pointer
+segfaults the Rusticl ir3qN compile worker with PC=0.
 
-  case nir_intrinsic_load_global_ir3:
-     ctx->funcs->emit_intrinsic_load_global_ir3(ctx, intr, dst);
+OpenGL ES 3.1 SSBO intrinsics use a different a4xx path
+(emit_intrinsic_load_ssbo etc.) which IS implemented — that's why
+GLES compute shaders work on a5xx but OpenCL didn't.
 
-Symptom on Adreno 506 (Fairphone 3+): every OpenCL kernel that reads
-or writes a __global buffer segfaults the Rusticl ir3qN worker
-thread with PC=0 inside ir3_compiler_nir.c emit_intrinsic at line
-2798 (load) or 2795 (store).
+Port the implementations from ir3_a6xx.c using only the basic LDG /
+STG instructions (cat6 opcodes 0 and 3, available since a3xx —
+instr-a3xx.h). The LDG_A / STG_A variants with register offsets are
+a6xx+ only (gated `#elif GPU >= 600` in ir3.h INSTR declarations),
+so on a5xx we accept only the constant-offset form.
 
-Port the implementations verbatim from ir3_a6xx.c. The cat6 LDG /
-STG / LDG_A / STG_A instruction macros have existed in the IR3 ISA
-since a3xx (see instr-a3xx.h opc 0/3), so a5xx hardware can execute
-them — only the IR3 emit path was missing. The a7xx-specific
-SHL_B-by-2 offset preshift (gated by `compiler->gen >= 7` in the
-a6xx version) is irrelevant on a5xx so it's dropped from the port.
+That's enough for Rusticl's typical NIR output: the lower_64b_global
+pass in ir3_nir_lower_64b.c emits the offset as nir_imm_int(b, off)
+where `off` is a small constant (vec-8/16 split index). Any kernel
+whose lowering produces a non-constant offset will hit the
+`unreachable` until someone wires up explicit 64-bit address
+arithmetic for a5xx.
 
-With this, a simple vec_add OpenCL kernel compiles and dispatches
-on Adreno 506.
+Identified via core-dump backtrace: addr2line on the lr offset
+0x2c62ec inside libRusticlOpenCL.so resolved to
+src/freedreno/ir3/ir3_compiler_nir.c:2798 in emit_intrinsic.
 
 --- a/src/freedreno/ir3/ir3_a4xx.c
 +++ b/src/freedreno/ir3/ir3_a4xx.c
-@@ -383,6 +383,85 @@ emit_intrinsic_atomic_global(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+@@ -383,6 +383,80 @@ emit_intrinsic_atomic_global(struct ir3_context *ctx, nir_intrinsic_instr *intr)
     unreachable("Global atomic are unimplemented on A5xx");
  }
 
@@ -40,28 +41,28 @@ on Adreno 506.
 +{
 +   struct ir3_builder *b = &ctx->build;
 +   unsigned dest_components = nir_intrinsic_dest_components(intr);
-+   struct ir3_instruction *addr, *offset;
++   struct ir3_instruction *addr;
 +
 +   addr = ir3_collect(b, ir3_get_src(ctx, &intr->src[0])[0],
 +                      ir3_get_src(ctx, &intr->src[0])[1]);
 +
-+   struct ir3_instruction *load;
-+
-+   bool const_offset_in_bounds =
-+      nir_src_is_const(intr->src[1]) &&
-+      nir_src_as_int(intr->src[1]) < (1 << 8) &&
-+      nir_src_as_int(intr->src[1]) > -(1 << 8);
-+
-+   if (const_offset_in_bounds) {
-+      load = ir3_LDG(b, addr, 0,
-+                     create_immed(b, nir_src_as_int(intr->src[1]) * 4),
-+                     0, create_immed(b, dest_components), 0);
-+   } else {
-+      offset = ir3_get_src(ctx, &intr->src[1])[0];
-+      load =
-+         ir3_LDG_A(b, addr, 0, offset, 0, create_immed(b, 0), 0,
-+                   create_immed(b, 0), 0, create_immed(b, dest_components), 0);
++   /* a5xx has no LDG_A (register-offset variant — that's a6xx+ only,
++    * gated `#elif GPU >= 600` in ir3.h). The NIR lower_64b_global pass
++    * emits the offset as a constant via nir_imm_int, so const offset
++    * is the common case; bail loudly on anything else so the failure
++    * is obvious instead of silently miscompiling.
++    */
++   if (!nir_src_is_const(intr->src[1]) ||
++       nir_src_as_int(intr->src[1]) >= (1 << 8) ||
++       nir_src_as_int(intr->src[1]) <= -(1 << 8)) {
++      unreachable("a5xx load_global_ir3 with non-constant or "
++                  "out-of-immediate-range offset (LDG_A is a6xx+ only)");
 +   }
++
++   struct ir3_instruction *load = ir3_LDG(
++      b, addr, 0,
++      create_immed(b, nir_src_as_int(intr->src[1]) * 4), 0,
++      create_immed(b, dest_components), 0);
 +
 +   load->cat6.type = type_uint_size(intr->def.bit_size);
 +   load->dsts[0]->wrmask = MASK(dest_components);
@@ -77,7 +78,7 @@ on Adreno 506.
 +                                nir_intrinsic_instr *intr)
 +{
 +   struct ir3_builder *b = &ctx->build;
-+   struct ir3_instruction *value, *addr, *offset;
++   struct ir3_instruction *value, *addr;
 +   unsigned ncomp = nir_intrinsic_src_components(intr, 0);
 +
 +   addr = ir3_collect(b, ir3_get_src(ctx, &intr->src[1])[0],
@@ -85,23 +86,18 @@ on Adreno 506.
 +
 +   value = ir3_create_collect(b, ir3_get_src(ctx, &intr->src[0]), ncomp);
 +
-+   struct ir3_instruction *stg;
-+
-+   bool const_offset_in_bounds = nir_src_is_const(intr->src[2]) &&
-+                                 nir_src_as_int(intr->src[2]) < (1 << 10) &&
-+                                 nir_src_as_int(intr->src[2]) > -(1 << 10);
-+
-+   if (const_offset_in_bounds) {
-+      stg = ir3_STG(b, addr, 0,
-+                    create_immed(b, nir_src_as_int(intr->src[2]) * 4), 0,
-+                    value, 0,
-+                    create_immed(b, ncomp), 0);
-+   } else {
-+      offset = ir3_get_src(ctx, &intr->src[2])[0];
-+      stg =
-+         ir3_STG_A(b, addr, 0, offset, 0, create_immed(b, 0), 0,
-+                   create_immed(b, 0), 0, value, 0, create_immed(b, ncomp), 0);
++   if (!nir_src_is_const(intr->src[2]) ||
++       nir_src_as_int(intr->src[2]) >= (1 << 10) ||
++       nir_src_as_int(intr->src[2]) <= -(1 << 10)) {
++      unreachable("a5xx store_global_ir3 with non-constant or "
++                  "out-of-immediate-range offset (STG_A is a6xx+ only)");
 +   }
++
++   struct ir3_instruction *stg = ir3_STG(
++      b, addr, 0,
++      create_immed(b, nir_src_as_int(intr->src[2]) * 4), 0,
++      value, 0,
++      create_immed(b, ncomp), 0);
 +
 +   stg->cat6.type = type_uint_size(intr->src[0].ssa->bit_size);
 +   stg->cat6.iim_val = 1;
@@ -115,7 +111,7 @@ on Adreno 506.
  const struct ir3_context_funcs ir3_a4xx_funcs = {
     .emit_intrinsic_load_ssbo = emit_intrinsic_load_ssbo,
     .emit_intrinsic_store_ssbo = emit_intrinsic_store_ssbo,
-@@ -391,7 +470,7 @@ const struct ir3_context_funcs ir3_a4xx_funcs = {
+@@ -391,7 +465,7 @@ const struct ir3_context_funcs ir3_a4xx_funcs = {
     .emit_intrinsic_store_image = emit_intrinsic_store_image,
     .emit_intrinsic_atomic_image = emit_intrinsic_atomic_image,
     .emit_intrinsic_image_size = emit_intrinsic_image_size_tex,
