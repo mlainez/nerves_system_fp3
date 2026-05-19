@@ -215,3 +215,19 @@ BR2_PACKAGE_JPEG_TURBO=y
 # uses). `libqmi` stays only because rmtfs and tqftpserv link against
 # `libqrtr` from the same source tree.
 # BR2_PACKAGE_MODEM_MANAGER is not set
+
+# GPU userspace — Mesa3D / Freedreno for the in-SoC Adreno 506 (a5xx).
+# Brings up the full GL/GLES/EGL/GBM stack via the gallium freedreno
+# driver plus OpenCL through Rusticl (Mesa's Rust OpenCL frontend).
+# No Vulkan: Freedreno's turnip driver only supports a6xx+, the Adreno
+# 506 is a5xx and has no production Vulkan path.
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_FREEDRENO=y
+BR2_PACKAGE_MESA3D_OPENGL=y
+BR2_PACKAGE_MESA3D_OPENGL_ES=y
+BR2_PACKAGE_MESA3D_OPENGL_EGL=y
+BR2_PACKAGE_MESA3D_GBM=y
+BR2_PACKAGE_MESA3D_LLVM=y
+BR2_PACKAGE_MESA3D_OPENCL=y
+BR2_PACKAGE_MESA3D_RUSTICL=y
+BR2_PACKAGE_CLINFO=y

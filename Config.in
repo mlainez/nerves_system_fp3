@@ -15,4 +15,19 @@ source "$NERVES_DEFCONFIG_DIR/packages/reboot-mode/Config.in"
 source "$NERVES_DEFCONFIG_DIR/packages/qbootctl/Config.in"
 source "$NERVES_DEFCONFIG_DIR/packages/fp3-camera-utils/Config.in"
 
+# Buildroot 2025.11's mesa3d Config.in only marks the iris and llvmpipe
+# Gallium drivers as RUSTICL_SUPPORTED_DRIVER, gating the
+# BR2_PACKAGE_MESA3D_OPENCL / RUSTICL menus. Upstream Mesa supports
+# Rusticl on Freedreno (a5xx / a6xx / a7xx) via
+# `-Drusticl-enable-drivers=freedreno`. This invisible config kicks the
+# hidden bool on whenever the freedreno gallium driver is enabled, so
+# the OpenCL menu becomes selectable without forking buildroot.
+# Remove once upstream buildroot's mesa3d Config.in allowlists
+# Freedreno for Rusticl.
+config BR2_NERVES_FP3_FORCE_MESA3D_RUSTICL_FREEDRENO
+	bool
+	default y
+	depends on BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_FREEDRENO
+	select BR2_PACKAGE_MESA3D_RUSTICL_SUPPORTED_DRIVER
+
 endmenu
