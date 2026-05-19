@@ -1,0 +1,24 @@
+Subject: clc_helpers: use getTargetOpts() for Clang 21 compatibility
+
+Clang 21 made CompilerInvocationBase::TargetOpts protected and changed
+it from `TargetOptions` to `std::shared_ptr<TargetOptions>`. Direct
+field access no longer compiles. The public accessor `getTargetOpts()`
+returns a `TargetOptions&` which is what `TargetInfo::CreateTargetInfo`
+expects.
+
+Builds against both Clang 20 (where the field was public and a value)
+and Clang 21 (where it's protected and a shared_ptr).
+
+This matches the upstream Mesa fix that landed in 25.2+.
+
+--- a/src/compiler/clc/clc_helpers.cpp
++++ b/src/compiler/clc/clc_helpers.cpp
+@@ -874,7 +874,7 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
+                            diag_opts));
+
+    c->setTarget(clang::TargetInfo::CreateTargetInfo(
+-                   c->getDiagnostics(), c->getInvocation().TargetOpts));
++                   c->getDiagnostics(), c->getInvocation().getTargetOpts()));
+
+    c->getFrontendOpts().ProgramAction = clang::frontend::EmitLLVMOnly;
+
