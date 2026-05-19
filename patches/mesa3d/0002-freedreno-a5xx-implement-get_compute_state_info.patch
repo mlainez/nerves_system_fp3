@@ -1,0 +1,60 @@
+Subject: freedreno/a5xx: implement get_compute_state_info
+
+Rusticl checks at context creation that the Gallium driver provides a
+get_compute_state_info callback. The a6xx Freedreno driver does (see
+fd6_compute.cc); the a5xx Freedreno driver did not, so Rusticl
+panicked at clCreateContext with:
+
+  Missing context feature get_compute_state_info
+  thread '<unnamed>' panicked at
+    'Context missing features. This should never happen!',
+    src/gallium/frontends/rusticl/mesa/pipe/context.rs:46
+
+Add a minimal a5xx version that reports device-wide max threads,
+SIMD size (= threadsize_base, the GPU's wavefront size) and zero
+private memory. This is conservative compared to a6xx (which clamps
+max_threads per-variant by register footprint and reports the
+shader's actual pvtmem usage), but it's enough to unblock Rusticl
+initialisation and lets OpenCL kernels dispatch on Adreno 5xx
+(Adreno 506 on the FP3+).
+
+Tested on Adreno 506 / SDM632 / Fairphone 3+. clinfo now enumerates
+the Freedreno OpenCL platform; previously it aborted on panic
+before reaching that point.
+
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_compute.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_compute.c
+@@ -7,6 +7,7 @@
+  */
+
+ #include "pipe/p_state.h"
++#include "freedreno_dev_info.h"
+
+ #include "freedreno_resource.h"
+
+@@ -167,6 +168,19 @@ fd5_launch_grid(struct fd_context *ctx,
+    }
+ }
+
++static void
++fd5_get_compute_state_info(struct pipe_context *pctx, void *cso,
++                           struct pipe_compute_state_object_info *cinfo)
++{
++   const struct fd_dev_info *info = fd_context(pctx)->screen->info;
++   uint32_t threadsize_base = info->threadsize_base;
++
++   cinfo->max_threads = threadsize_base * info->max_waves;
++   cinfo->simd_sizes = threadsize_base;
++   cinfo->preferred_simd_size = threadsize_base;
++   cinfo->private_memory = 0;
++}
++
+ void
+ fd5_compute_init(struct pipe_context *pctx) disable_thread_safety_analysis
+ {
+@@ -174,4 +188,5 @@ fd5_compute_init(struct pipe_context *pctx) disable_thread_safety_analysis
+    ctx->launch_grid = fd5_launch_grid;
+    pctx->create_compute_state = ir3_shader_compute_state_create;
+    pctx->delete_compute_state = ir3_shader_state_delete;
++   pctx->get_compute_state_info = fd5_get_compute_state_info;
+ }
