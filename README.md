@@ -149,7 +149,7 @@ built that way is not reproducible by anyone else.
 ## Flashing
 
 The stock Fairphone 3 bootloader will not chain-load a foreign kernel, so
-[lk2nd-msm8953](https://github.com/msm8953-mainline/lk2nd) goes on `boot`
+[lk2nd](https://github.com/msm8916-mainline/lk2nd) goes on `boot`
 first and the Nerves firmware into `userdata`:
 
 ```bash
