@@ -14,7 +14,11 @@ BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
 BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
 BR2_TAR_OPTIONS="--no-same-owner"
 BR2_BACKUP_SITE="http://dl.nerves-project.org"
-BR2_ENABLE_DEBUG=y
+# Debug symbols are stripped from the target either way, but with LLVM in the
+# build (Rusticl needs it) they inflate the staging sysroot from ~1 GB to
+# ~24 GB, and with it the published artifact. Turn them on locally when you
+# actually need them.
+# BR2_ENABLE_DEBUG is not set
 BR2_GLOBAL_PATCH_DIR="${BR2_EXTERNAL_NERVES_PATH}/patches ${NERVES_DEFCONFIG_DIR}/patches"
 BR2_PACKAGE_OVERRIDE_FILE="${NERVES_DEFCONFIG_DIR}/local.mk"
 BR2_REPRODUCIBLE=y
