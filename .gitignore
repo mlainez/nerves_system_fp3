@@ -5,8 +5,10 @@
 /.fetch
 /.nerves
 build.log
+archive.log
 erl_crash.dump
 *.ez
+*.tar.gz
 /buildroot-*
 
 # Buildroot package overrides — developer-local paths only.
