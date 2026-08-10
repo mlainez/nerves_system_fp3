@@ -1,0 +1,15 @@
+# Buildroot package override file — copy to local.mk to use.
+#
+# nerves_defconfig sets BR2_PACKAGE_OVERRIDE_FILE to ${NERVES_DEFCONFIG_DIR}/local.mk.
+# Buildroot -includes it, so having no local.mk is the normal case: the
+# kernel is then fetched from the pinned commit in nerves_defconfig and
+# builds are reproducible.
+#
+# Point <PKG>_OVERRIDE_SRCDIR at a local checkout to build that package
+# from your working tree instead. Useful for kernel work — buildroot
+# rsyncs the tree rather than re-cloning, so edit/build/flash cycles stay
+# fast. Note that an override silently replaces the pinned source, so
+# a firmware built this way is not reproducible by anyone else.
+
+# LINUX_OVERRIDE_SRCDIR = $(HOME)/Projects/linux-msm8953
+# MESA3D_OVERRIDE_SRCDIR = $(HOME)/Projects/mesa

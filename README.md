@@ -1,41 +1,63 @@
-# Fairphone 3 / 3+
+# Nerves System: Fairphone 3 / 3+
 
-Nerves System configuration for the **Fairphone 3** and **Fairphone
-3+** (both Qualcomm Snapdragon 632 / MSM8953, aarch64).
+Nerves system for the **Fairphone 3** and **Fairphone 3+** — Qualcomm
+Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 
-A single firmware image works on both boards: the kernel build ships
-`sdm632-fairphone-fp3.dtb` *and* `sdm632-fairphone-fp3p.dtb` in the
-boot partition, and `extlinux.conf` carries one labelled menu entry
-per device. The FP3+ label is the silent default; pick `Nerves
-(Fairphone 3)` from lk2nd's menu (increase `timeout` in
-`extlinux/extlinux.conf` if you need more than 1 s to choose) or
-swap the `default`/`menu default` markers to flip it.
+| Feature      | Description                                                 |
+| ------------ | ----------------------------------------------------------- |
+| CPU          | 8× Snapdragon 632 (Cortex-A53, aarch64)                     |
+| GPU          | Adreno 506 — OpenGL ES + OpenCL 3.0 (Mesa Freedreno/Rusticl)|
+| Memory       | 3 GB LPDDR3                                                 |
+| Storage      | eMMC; firmware lives inside the Android `userdata` partition|
+| Linux        | `mlainez/linux-msm8953`, 6.19                               |
+| Bootloader   | lk2nd-msm8953 → `extlinux/extlinux.conf` on the boot partition |
+| Console      | On-device display (`tty1`) or serial debug pads (`ttyMSM0`) |
+| Cellular     | 2G/3G/LTE dual SIM over QMI                                 |
+| Wi-Fi / BT   | wcnss/prima via remoteproc, BlueZ userspace                 |
+| NFC          | Yes                                                         |
+| GNSS         | Yes                                                         |
+| Camera       | Front + rear through CAMSS to V4L2                          |
+| Audio        | Loudspeaker via ADSP                                        |
+| Sensors      | Qualcomm ADSP sensor stack, exposed through IIO             |
 
-| Feature              | Description                                                   |
-| -------------------- | ------------------------------------------------------------- |
-| CPU                  | 8x Qualcomm Snapdragon 632 (Cortex-A53, aarch64)              |
-| GPU                  | Qualcomm Adreno 506                                           |
-| Memory               | 3 GB LPDDR3 RAM                                               |
-| Storage              | eMMC, firmware lives on the Android `userdata` partition      |
-| Linux kernel         | `mlainez/linux-msm8953`, branch `staging`                     |
-| Bootloader           | lk2nd-msm8953 → extlinux/extlinux.conf on the rootfs          |
-| IEx terminal         | On-device display (`tty1`) or serial debug port (`ttyMSM0`)   |
-| WiFi                 | wcnss / prima (firmware + driver loaded via remoteproc)       |
-| Bluetooth            | wcnss BT (BlueZ userspace)                                    |
-| Audio                | Loudspeaker via ADSP + TAS2557 / AW8898 amplifier firmware    |
-| Sensors              | ADSP sensor stack (sns.reg + `qcom_sns_reg`)                  |
-| Modem                | 2G/3G/LTE dual SIM via QMI + `vintage_net_qmi`                |
+## One image, two phones
 
-## Acknowledgements
+The Fairphone 3 is built to be taken apart. Its rear camera, front camera and
+loudspeaker are user-replaceable with a #00 screwdriver, and the Fairphone 3+
+upgrade kit fits different silicon in each:
 
-This system is a port of the
-[citronics buildroot-fp2 external tree](https://github.com/Citronics/buildroot-fp2)
-(despite the name, that tree carries the working Fairphone 3 board
-files), shaped to match the Nerves
-[porting guide](https://github.com/nerves-project/nerves/blob/main/guides/advanced/porting-guide.md).
-The firmware blobs and kernel-config additions come from the citronics
-port; the `/etc/init.d/Sxx` userspace bring-up has been replaced by a
-collection of small, focused OTP applications.
+| Slot         | Fairphone 3            | Fairphone 3+            |
+| ------------ | ---------------------- | ----------------------- |
+| Rear camera  | Sony IMX363 (12MP)     | Samsung S5KGM1SP (48MP) |
+| Rear AF      | AK7374                 | DW9800W                 |
+| Front camera | Samsung S5K4H7YX (8MP) | Samsung S5K3P9SP (16MP) |
+| Loudspeaker  | Awinic AW8898          | TI TAS2557              |
+
+Both models share one mainboard and report identical `qcom,msm-id = <349 0>`
+and `qcom,board-id = <8 0x10000>`, so nothing before boot can tell them
+apart — and because the modules are sold separately, a given phone can carry
+any mix of the two generations.
+
+So this system ships **one device tree that describes the slots rather than
+their contents**. `sdm632-fairphone-fp3.dts` carries only what is soldered
+down: which I²C bus each module hangs off, its regulators, its reference
+clock and its enable line. At boot, `drivers/misc/fp3_module_slot.c` powers
+each slot up, reads the chip's ID register, and applies a device tree overlay
+describing what it found. CAMSS and the sound card stay `disabled` until
+then, so they only ever probe against hardware that is actually present. The
+stock, unmodified sensor and codec drivers bind normally afterwards.
+
+There is no per-variant image, no boot menu and no reboot. `dmesg` reports
+what was found:
+
+```
+fp3-module-slots: rear-camera slot: Samsung S5KGM1SP (48MP, Fairphone 3+)
+fp3-module-slots: front-camera slot: Samsung S5K3P9SP (16MP, Fairphone 3+)
+fp3-module-slots: speaker-amp slot: TI TAS2557 (Fairphone 3+)
+```
+
+A slot whose module is missing or unrecognised logs a warning and is skipped;
+the rest of the phone still boots.
 
 ## Using
 
@@ -45,244 +67,169 @@ In your Nerves application's `mix.exs`:
 defp deps do
   [
     {:nerves_system_fp3,
-      git: "https://github.com/Spin42/nerves_system_fp3",
+      github: "mlainez/nerves_system_fp3",
       runtime: false, targets: :fp3, nerves: [compile: true]},
 
-    # Native daemons (one small OTP app each).
-    {:ex_rmtfs, github: "mlainez/ex_rmtfs", targets: :fp3},
-    {:ex_tqftpserv, github: "mlainez/ex_tqftpserv", targets: :fp3},
+    # Qualcomm bring-up: each of these owns one slice of it.
+    {:ex_rmtfs,       github: "mlainez/ex_rmtfs",       targets: :fp3},
+    {:ex_tqftpserv,   github: "mlainez/ex_tqftpserv",   targets: :fp3},
+    {:ex_hexagonfs,   github: "mlainez/ex_hexagonfs",   targets: :fp3},
     {:ex_hexagonrpcd, github: "mlainez/ex_hexagonrpcd", targets: :fp3},
+    {:ex_remoteproc,  github: "mlainez/ex_remoteproc",  targets: :fp3},
 
-    # FP3-specific bring-up bits.
-    {:ex_hexagonfs, github: "mlainez/ex_hexagonfs", targets: :fp3},
-
-    # Cellular networking — same stack the FP2 system uses.
-    {:vintage_net_qmi, github: "mlainez/vintage_net_qmi", targets: :fp3}
-  ]
-end
-
-def application do
-  [
-    extra_applications: [
-      :logger,
-      :ex_hexagonfs,
-      :ex_rmtfs,
-      :ex_tqftpserv,
-      :ex_hexagonrpcd
-    ],
-    mod: {MyApp.Application, []}
+    # Cellular data.
+    {:vintage_net_qmi, github: "mlainez/vintage_net_qmi", targets: :fp3},
+    {:fp3_modem,       github: "mlainez/fp3_modem",       targets: :fp3}
   ]
 end
 ```
 
-Set `MIX_TARGET=fp3` and you're off.
+Then set `MIX_TARGET=fp3`.
 
-The `ex_*` OTP apps each handle one slice of the bring-up and log a
-warning on bad hardware instead of crashing — order them in
-`extra_applications` how you like, but the listing above mirrors the
-buildroot port's S20→S39 ordering.
+The Qualcomm bring-up that a Buildroot port would do from `/etc/init.d/S*` is
+split into small OTP applications instead, each handling one slice and logging
+a warning rather than crashing on unexpected hardware:
 
-## Configuration
+| Library | What it needs from this system |
+| --- | --- |
+| [`ex_rmtfs`](https://github.com/mlainez/ex_rmtfs) | `rmtfs`; QRTR |
+| [`ex_tqftpserv`](https://github.com/mlainez/ex_tqftpserv) | `tqftpserv`; QRTR |
+| [`ex_hexagonfs`](https://github.com/mlainez/ex_hexagonfs) | ACDB/DSP blobs at `/mnt/vendor`, `/mnt/dsp` |
+| [`ex_hexagonrpcd`](https://github.com/mlainez/ex_hexagonrpcd) | `hexagonrpcd`; `/dev/fastrpc-adsp` |
+| [`ex_remoteproc`](https://github.com/mlainez/ex_remoteproc) | `/sys/class/remoteproc`; rmtfs serving first |
+| [`ex_qcom_smgr`](https://github.com/mlainez/ex_qcom_smgr) | `qcom_smgr`; `/sys/bus/iio/devices` |
+| [`ex_audio`](https://github.com/mlainez/ex_audio) | `amixer`; ADSP up before the card binds |
+| [`ex_nfc`](https://github.com/mlainez/ex_nfc) | `NETLINK_GENERIC` + the kernel `nfc` family |
+| [`ex_location`](https://github.com/mlainez/ex_location) | QRTR; modem MSS running |
+| [`fp3_camera`](https://github.com/mlainez/fp3_camera) | `media-ctl`, `cam-snap`, `cam-stream` |
+| [`fp3_modem`](https://github.com/mlainez/fp3_modem) | QRTR + the IPA data path |
+| [`ex_qbootctl`](https://github.com/mlainez/ex_qbootctl) | `/usr/bin/qbootctl` |
+| [`nerves_data_resize`](https://github.com/mlainez/nerves_data_resize) | `resize.f2fs`, `blockdev` |
 
-```elixir
-# config/target.exs
-config :vintage_net_qmi, ...   # your APN / service-provider config
-```
+The QRTR, remoteproc, fastrpc, sns-reg, sysmon and pd-mapper kernel modules
+are all built in — there is nothing to `modprobe`.
 
-`ex_hexagonfs` and `ex_hexagonrpcd` default to the FP3 layout so they
-need no config on this board. The Qualcomm QRTR / remoteproc /
-fastrpc / sns-reg / sysmon / pd-mapper modules are all `=y` in the
-kernel config — nothing to modprobe.
+## Building
 
-## Building the firmware
-
-The Nerves system is consumed like any other — by a Nerves
-application that targets it. The shortest path from this checkout
-to a flashable image:
+You need the Nerves toolchain prerequisites for your platform (see the
+[Nerves installation guide](https://hexdocs.pm/nerves/installation.html)):
+Erlang, Elixir, `fwup`, `squashfs-tools`, `cmake`, `autoconf`, `bc` and
+`libssl-dev`.
 
 ```bash
-# 1. Prerequisites (one-off, see https://hexdocs.pm/nerves/installation.html
-#    for your platform; you need erlang + elixir + fwup + ssh-askpass +
-#    squashfs-tools + cmake + autoconf + bc + libssl-dev).
 mix archive.install hex nerves_bootstrap
 
-# 2. Create a throw-away Nerves app next to nerves_system_fp3 (skip if
-#    you already have one).
-cd /var/home/marc/Projects
+# A throw-away app to build against.
 mix nerves.new fp3_demo --target fp3
 cd fp3_demo
-```
 
-Edit `fp3_demo/mix.exs` so the system and the runtime libs are path
-deps pointing at your checkouts:
-
-```elixir
-@all_targets [:fp3]
-
-defp deps do
-  [
-    {:nerves, "~> 1.11", runtime: false},
-    {:shoehorn, "~> 0.9"},
-    {:ring_logger, "~> 0.11"},
-    {:toolshed, "~> 0.4"},
-
-    {:nerves_system_fp3,
-      path: "../nerves_system_fp3",
-      runtime: false, targets: :fp3, nerves: [compile: true]},
-
-    {:ex_rmtfs,        path: "../ex_rmtfs",        targets: :fp3},
-    {:ex_tqftpserv,    path: "../ex_tqftpserv",    targets: :fp3},
-    {:ex_hexagonrpcd,  path: "../ex_hexagonrpcd",  targets: :fp3},
-    {:ex_hexagonfs,    path: "../ex_hexagonfs",    targets: :fp3},
-    {:vintage_net_qmi, path: "../vintage_net_qmi", targets: :fp3}
-  ]
-end
-
-def application do
-  [
-    extra_applications: [
-      :logger, :ex_hexagonfs, :ex_rmtfs, :ex_tqftpserv, :ex_hexagonrpcd
-    ],
-    mod: {FP3Demo.Application, []}
-  ]
-end
-```
-
-Then build:
-
-```bash
-# 3. Set the target. `:fp3` matches the `targets:` keys above.
 export MIX_TARGET=fp3
-
-# 4. Pull deps. This downloads the aarch64 Nerves toolchain
-#    (~250 MB), the citronics buildroot sources and the
-#    mlainez/linux-msm8953 staging kernel, then runs Buildroot. First
-#    build is 30–60 min; later rebuilds are incremental.
-mix deps.get
-mix compile
-
-# 5. Build the .fw firmware archive.
-mix firmware
-
-# 6. Convert it to a raw .img that fastboot can flash into userdata.
-mix firmware.image
+mix deps.get      # pulls the toolchain (~250 MB), Buildroot and the kernel
+mix firmware      # first build is 30–60 min; rebuilds are incremental
+mix firmware.image # raw .img for fastboot
 ```
 
-Useful side-channels:
+Useful side channels:
 
-- `mix firmware.unpack` — peek inside the .fw
-- `mix nerves.system.shell` — drop into the system's buildroot
-  build directory with a properly-set environment, so you can run
-  `make menuconfig`, `make linux-menuconfig`, etc. against this
-  exact tree
-- `MIX_DEBUG=1 mix compile` — see every Buildroot command
-- `rm -rf _build/fp3_*` then `mix deps.compile nerves_system_fp3
-  --force` — nuke and rebuild just the system after a defconfig
-  tweak
+- `mix nerves.system.shell` — a shell in the Buildroot build directory with
+  the environment set, for `make menuconfig` / `make linux-menuconfig`
+- `MIX_DEBUG=1 mix compile` — every Buildroot command
+- `rm -rf _build/fp3_* && mix deps.compile nerves_system_fp3 --force` —
+  rebuild the system after a defconfig change
 
-## Flashing for the first time
+### Working on the kernel
 
-The stock Fairphone 3 bootloader refuses to chain-load a foreign
-kernel — flash `lk2nd-msm8953` over `boot` first, then push your
-Nerves firmware into `userdata`:
+`nerves_defconfig` pins the kernel to an exact commit so builds are
+reproducible. To build from a local checkout instead, copy `local.mk.example`
+to `local.mk` and point `LINUX_OVERRIDE_SRCDIR` at your tree. `local.mk` is
+gitignored, and Buildroot `-include`s it, so its absence is the normal case.
+Remember that an override silently replaces the pinned source — firmware
+built that way is not reproducible by anyone else.
+
+## Flashing
+
+The stock Fairphone 3 bootloader will not chain-load a foreign kernel, so
+[lk2nd-msm8953](https://github.com/msm8953-mainline/lk2nd) goes on `boot`
+first and the Nerves firmware into `userdata`:
 
 ```bash
-# Boot the FP3 into fastboot (Vol Down + Power), USB-attached.
-fastboot flashing unlock                    # once per device
-fastboot flash boot lk2nd-msm8953.img       # second-stage bootloader
-fastboot flash userdata fp3_demo.img        # the file `mix firmware.image` produced
+# Boot into fastboot: hold Volume Down while powering on, USB attached.
+fastboot flashing unlock              # once per device, erases the phone
+fastboot flash boot lk2nd-msm8953.img
+fastboot flash userdata fp3_demo.img  # from `mix firmware.image`
 fastboot reboot
 ```
 
+After that, `mix upload` works over the network as usual.
+
 ## Partition layout
 
-The Fairphone 3 bootloader will not let us add new partitions to the
-eMMC, so the entire Nerves layout is *nested* inside the Android
-`userdata` partition (`/dev/mmcblk0p62`). The citronics initramfs
-runs `kpartx -asf /dev/mmcblk0p62` very early during boot, exposing
-subpartitions as `/dev/mmcblk0p62p1` … `/dev/mmcblk0p62p3`.
+The Fairphone 3 bootloader will not let us add eMMC partitions, so the whole
+Nerves layout is nested *inside* the Android `userdata` partition
+(`/dev/mmcblk0p62`). The citronics initramfs runs `kpartx -asf` on it very
+early, exposing `/dev/mmcblk0p62p1` … `p3`.
 
 ```
-/dev/mmcblk0p62   ─── flashed via `fastboot flash userdata fp3_demo.img` ───
+/dev/mmcblk0p62   ── flashed with `fastboot flash userdata` ──
 ├─ MBR (block 0)
 ├─ uboot env       (Nerves firmware metadata, 8 KiB)
 ├─ Boot A          (ext2, 50 MiB — kernel + dtb + initramfs + extlinux)
 ├─ Boot B          (ext2, 50 MiB)
 ├─ Rootfs A        (squashfs, 250 MiB)
 ├─ Rootfs B        (squashfs, 250 MiB)
-└─ Application     (f2fs, expands to fill the partition, mounted at /root)
+└─ Application     (f2fs, fills the rest, mounted at /root)
 ```
 
-lk2nd-msm8953 reads `/extlinux/extlinux.conf` from the active boot
-subpartition and loads `Image` + `sdm632-fairphone-fp3.dtb` +
-`initramfs.gz`. The kernel command line passes `rootfs=` /
-`bootpart=` to the initramfs, which kpartx-maps the parent device,
-mounts the rootfs subpartition read-only at `/sysroot/`, mounts the
-boot subpartition at `/sysroot/boot`, and `switch_root`s into it.
+lk2nd reads `/extlinux/extlinux.conf` from the active boot subpartition and
+loads `Image`, `sdm632-fairphone-fp3.dtb` and `initramfs.gz`. The kernel
+command line passes `rootfs=` and `bootpart=` to the initramfs, which maps
+the subpartitions, mounts the rootfs read-only and `switch_root`s into it.
 
-`erlinit` mounts:
+`erlinit` then mounts `/dev/mmcblk0p62p1` at `/boot`, `p3` at `/root`, and
+the read-only Android partitions `p32`, `p34` and `p13` at `/mnt/vendor`,
+`/mnt/persist` and `/mnt/dsp` for `ex_hexagonfs`.
 
-- `/dev/mmcblk0p62p1` → `/boot` (ext2, ro)
-- `/dev/mmcblk0p62p3` → `/root` (f2fs, application data)
-- `/dev/mmcblk0p32`, `p34`, `p13` → `/mnt/{vendor,persist,dsp}` (Android
-  partitions used by `ex_hexagonfs`).
+## Notes on specific hardware
 
-The rootfs also ships a `/usr/share/qcom → /run/qcom` symlink so
-`hexagonrpcd`'s compatible-string auto-discovery finds the populated
-HexagonFS tree.
+**Modem and Wi-Fi.** The kernel auto-boots the ADSP and modem remoteprocs; no
+userspace nudge is needed. `VintageNetQMI.quick_configure("internet")` brings
+up cellular data. Wi-Fi is `wpa_supplicant` + VintageNet.
 
-## Loudspeaker
+**Audio.** `aplay -D plughw:0,0 file.wav`. The amplifier firmware comes from
+the `fp3-firmware` package.
 
-TAS2557 / AW8898 firmware blobs come from the `fp3-firmware`
-buildroot package; ALSA tooling is built in. After boot:
+**Camera.** `fp3-cam-setup` configures the CAMSS media graph; `cam-snap`,
+`cam-stream` and `cam-grab` capture stills, H.264 and raw Bayer. Demosaicing
+is done in software — the msm8953 CPP hardware ISP is not driven.
 
-```
-aplay -D plughw:0,0 /usr/share/sounds/hello.wav
-```
+**Sensors.** The Qualcomm stack runs on the ADSP and surfaces under
+`/sys/bus/iio/devices/`.
 
-or from Elixir:
+**UART.** `ttyMSM0` exists but needs wires soldered to pads inside the phone.
+Swap the `-c` line in `rootfs_overlay/etc/erlinit.config` to move the IEx
+prompt there.
 
-```elixir
-System.cmd("aplay", ["-D", "plughw:0,0", path])
-```
+## Known gaps
 
-## Modem and Wi-Fi
+- `cl_khr_fp16` is rejected by Rusticl on Adreno 506. For memory-bound work,
+  pack to int8/int4 and dequantise to fp32.
+- Convolution on the GPU hits an IR3 shader hang on a5xx and falls back to
+  the CPU.
+- GPS XTRA assistance data is not downloaded.
+- The USB gadget IDs in `packages/citronics-initramfs/deviceinfo` are the
+  generic Google ones; a product should use its own.
 
-The kernel auto-boots both the ADSP and the modem (MSS) remoteprocs;
-no userspace nudge is needed. Once they're up, `vintage_net_qmi`
-handles UIM provisioning, the data session and DHCP exactly as on
-the FP2:
+## Acknowledgements
 
-```elixir
-VintageNetQMI.quick_configure("internet")
-```
+Ported from the [citronics buildroot-fp2 external
+tree](https://github.com/Citronics/buildroot-fp2) — which, despite the name,
+carries the working Fairphone 3 board files — reshaped to follow the Nerves
+[porting guide](https://github.com/nerves-project/nerves/blob/main/guides/advanced/porting-guide.md).
+The kernel is a fork of
+[msm8953-mainline/linux](https://github.com/msm8953-mainline/linux).
 
-Wi-Fi is `wpa_supplicant` + VintageNet.
+## License
 
-## Sensors
-
-The Qualcomm sensor stack runs on the ADSP and surfaces through
-`/sys/bus/iio/devices/iio:deviceN/`. Once the ADSP is alive:
-
-```elixir
-File.ls!("/sys/bus/iio/devices")
-|> Enum.filter(&String.starts_with?(&1, "iio:device"))
-```
-
-## UART
-
-`ttyMSM0` is available but requires opening the phone and soldering
-wires to the motherboard pads. Swap the `-c` line in `erlinit.config`
-to redirect the IEx prompt there.
-
-## Known gaps / next steps
-
-- Both the ADSP and modem (MSS) rely on the kernel's
-  `auto_boot=true`. If a future kernel disables that, package an
-  `ex_adsp_boot` / `ex_modem_boot` OTP app that writes `start` to
-  the relevant `/sys/class/remoteproc/<rproc>/state`.
-- GPS XTRA-download is not wired up; add it as another small `ex_*`
-  OTP app if needed.
-- The deviceinfo USB IDs (`0x18d1` / `0xd001`, generic Google) are
-  fine for fastboot-style hosts but a real product should use its
-  own assigned VID/PID. Edit `packages/citronics-initramfs/deviceinfo`.
+Apache-2.0 — see [LICENSE](LICENSE). A built firmware image aggregates many
+differently licensed components and downloads proprietary Qualcomm and
+Fairphone firmware at build time; see [NOTICE](NOTICE).

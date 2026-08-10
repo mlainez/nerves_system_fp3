@@ -1,7 +1,7 @@
 defmodule NervesSystemFP3.MixProject do
   use Mix.Project
 
-  @github_organization "Spin42"
+  @github_organization "mlainez"
   @app :nerves_system_fp3
   @source_url "https://github.com/#{@github_organization}/#{@app}"
   @version Path.join(__DIR__, "VERSION")

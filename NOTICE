@@ -1,0 +1,59 @@
+nerves_system_fp3
+Copyright 2026 Marc Lainez
+
+This product includes software developed as part of the Nerves Project
+(https://nerves-project.org/).
+
+--------------------------------------------------------------------------
+What this repository is licensed under
+--------------------------------------------------------------------------
+
+The build system in this repository — the Buildroot external tree, the
+package definitions under packages/, the fwup configuration, the boot image
+scripts, the kernel configuration and the rootfs overlay — is licensed under
+the Apache License 2.0. See LICENSE.
+
+Two packages carry sources written for this board, under their own terms:
+
+  packages/fp3-camera-utils/src/   MIT
+  packages/reboot-mode/            MIT
+
+--------------------------------------------------------------------------
+What the firmware this repository builds contains
+--------------------------------------------------------------------------
+
+A firmware image built from this tree is an aggregate of many independently
+licensed components, fetched from their upstreams at build time. The build
+produces a full manifest — run `make legal-info` in the Buildroot output
+directory, or see `legal-info/` in the build tree, for the authoritative
+list. The notable ones:
+
+  Linux kernel              GPL-2.0 WITH Linux-syscall-note
+                            mlainez/linux-msm8953
+
+  Buildroot + base userland  various (GPL-2.0, LGPL-2.1, BSD, MIT, ...)
+                            see nerves_system_br
+
+  hexagonrpc                GPL-3.0     linux-msm/hexagonrpc
+  unudhcpd                  GPL-3.0     postmarketOS/unudhcpd
+  qrtr                      BSD-3-Clause linux-msm/qrtr
+  rmtfs                     BSD-3-Clause linux-msm/rmtfs
+  tqftpserv                 BSD-3-Clause linux-msm/tqftpserv
+  qbootctl                  BSD-3-Clause linux-msm/qbootctl
+  citronics-initramfs       GPL-2.0     Citronics/initramfs
+  Mesa 3D / Freedreno       MIT
+
+--------------------------------------------------------------------------
+Proprietary firmware
+--------------------------------------------------------------------------
+
+The `fp3-firmware` package downloads proprietary Qualcomm and Fairphone
+firmware blobs from https://github.com/FairBlobs/FP3-firmware at build time:
+the modem (MPSS), ADSP, WCNSS Wi-Fi/Bluetooth, Venus video codec and Adreno
+GPU images, the WLAN NV data, the speaker amplifier DSP firmware and the ADSP
+sensor registry.
+
+These are NOT redistributed by this repository, are not covered by the
+Apache-2.0 license above, and remain the property of their respective owners.
+They are required for the modem, Wi-Fi, Bluetooth, GPU, audio and sensors to
+function. Set BR2_PACKAGE_FP3_FIRMWARE=n to build without them.

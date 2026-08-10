@@ -8,3 +8,10 @@ build.log
 erl_crash.dump
 *.ez
 /buildroot-*
+
+# Buildroot package overrides — developer-local paths only.
+# See local.mk.example.
+/local.mk
+
+# Editor / tooling state
+/.claude/

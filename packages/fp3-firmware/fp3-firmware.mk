@@ -4,9 +4,13 @@
 #
 ################################################################################
 
-FP3_FIRMWARE_VERSION = ee529820bb874ab1b52873f0b144c3786f01ee4c
-FP3_FIRMWARE_SITE = $(call github,FairBlobs,FP3-firmware,$(FP3_FIRMWARE_VERSION))
+# mlainez/FP3-firmware is FairBlobs/FP3-firmware plus the ADSP sensor
+# registry (sensors/sns.reg), which upstream does not carry. Everything
+# else is identical. Switch back to FairBlobs if the registry lands there.
+FP3_FIRMWARE_VERSION = 2b4cea45e30eaa6ca0cdfc210e7258e58d4a994f
+FP3_FIRMWARE_SITE = $(call github,mlainez,FP3-firmware,$(FP3_FIRMWARE_VERSION))
 FP3_FIRMWARE_LICENSE = proprietary
+FP3_FIRMWARE_REDISTRIBUTE = NO
 
 define FP3_FIRMWARE_INSTALL_TARGET_CMDS
 	mkdir -p $(TARGET_DIR)/lib/firmware/qcom/msm8953/fairphone/fp3
@@ -68,8 +72,8 @@ define FP3_FIRMWARE_INSTALL_TARGET_CMDS
 	ln -sf wcnss.mdt $(TARGET_DIR)/lib/firmware/qcom/msm8953/fairphone/fp3/wcnss.mbn
 	ln -sf modem.mdt $(TARGET_DIR)/lib/firmware/qcom/msm8953/fairphone/fp3/modem.mbn
 	ln -sf a506_zap.mdt $(TARGET_DIR)/lib/firmware/qcom/msm8953/fairphone/fp3/a506_zap.mbn
-	# Sensor registry (sns.reg for in-kernel QCOM_SNS_REG driver)
-	$(INSTALL) -D -m 644 $(NERVES_DEFCONFIG_DIR)/packages/fp3-firmware/sns.reg \
+	# Sensor registry (sns.reg for the in-kernel QCOM_SNS_REG driver)
+	$(INSTALL) -D -m 644 $(@D)/sensors/sns.reg \
 		$(TARGET_DIR)/lib/firmware/qcom/sensors/sns.reg
 	# TAS2557 speaker amplifier firmware (FP3+)
 	$(INSTALL) -D -m 644 $(@D)/tas2557_uCDSP.bin \
