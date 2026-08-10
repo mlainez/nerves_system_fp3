@@ -41,7 +41,7 @@ BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/mlainez/linux-msm8953"
 # Pinned to the tag fp3-6.19-v1. A SHA rather than a branch name: the
 # Nerves artifact checksum is computed from package_files() in mix.exs,
 # so a moving branch lets a stale prebuilt artifact be reused silently.
-BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="b258b0bc1c61fdc78cf36643dd0d0f74d7020c3d"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="c3f8be7c3799d8a6876c1a884c578cf12ef07348"
 BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
 BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="${NERVES_DEFCONFIG_DIR}/linux-6.19.defconfig"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
