@@ -22,6 +22,18 @@ but never released and carried two defects fixed here.
   637 MB; LLVM alone had shipped 977 MB of debug info for Rusticl's runtime
   OpenCL compiler.
 
+### Removed
+
+- **OpenCL / Rusticl.** Compiling kernels at runtime means shipping clang and
+  LLVM on the device: `libLLVM` 62 MB, `libclang-cpp` 58 MB, `libclang` 32 MB,
+  `libRusticlOpenCL` 11 MB and 14 MB of libclc SPIR-V, together 177 MB of a
+  520 MB rootfs — and `rootfs.squashfs` was filling 91% of its 250 MiB
+  partition. OpenCL 3.0 genuinely worked on the Adreno 506, but `cl_khr_fp16`
+  is rejected on a5xx and convolution trips an IR3 shader hang, so the
+  workloads it was added for ended up faster on the CPU. The a5xx compute
+  patches stay in `patches/mesa3d` — GLES 3.1 compute shaders use the same
+  ir3 paths — and `BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL}` brings it back.
+
 ## v0.1.0
 
 First public release. Nerves system for the Fairphone 3 and Fairphone 3+

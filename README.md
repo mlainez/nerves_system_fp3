@@ -6,7 +6,7 @@ Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 | Feature      | Description                                                 |
 | ------------ | ----------------------------------------------------------- |
 | CPU          | 8× Snapdragon 632 (Cortex-A53, aarch64)                     |
-| GPU          | Adreno 506 — OpenGL ES + OpenCL 3.0 (Mesa Freedreno/Rusticl)|
+| GPU          | Adreno 506 — OpenGL ES (Mesa Freedreno)                     |
 | Memory       | 3 GB LPDDR3                                                 |
 | Storage      | eMMC; firmware lives inside the Android `userdata` partition|
 | Linux        | `mlainez/linux-msm8953`, 6.19                               |
@@ -211,10 +211,13 @@ prompt there.
 
 ## Known gaps
 
-- `cl_khr_fp16` is rejected by Rusticl on Adreno 506. For memory-bound work,
-  pack to int8/int4 and dequantise to fp32.
-- Convolution on the GPU hits an IR3 shader hang on a5xx and falls back to
-  the CPU.
+- **No OpenCL.** Rusticl compiles kernels at runtime, so it puts clang and
+  LLVM on the device — 177 MB of a 520 MB rootfs, against a 250 MiB rootfs
+  partition. It does work on this GPU (OpenCL 3.0, with the a5xx compute
+  patches in `patches/mesa3d`), but on a5xx `cl_khr_fp16` is rejected and
+  convolution trips an IR3 shader hang, so the workloads that motivated it
+  ran faster on the CPU anyway. Re-enable
+  `BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL}` if you need it.
 - GPS XTRA assistance data is not downloaded.
 - The USB gadget IDs in `packages/citronics-initramfs/deviceinfo` are the
   generic Google ones; a product should use its own.

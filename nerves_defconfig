@@ -14,10 +14,9 @@ BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
 BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
 BR2_TAR_OPTIONS="--no-same-owner"
 BR2_BACKUP_SITE="http://dl.nerves-project.org"
-# Debug symbols are stripped from the target either way, but with LLVM in the
-# build (Rusticl needs it) they inflate the staging sysroot from ~1 GB to
-# ~24 GB, and with it the published artifact. Turn them on locally when you
-# actually need them.
+# Debug symbols are stripped from the target either way, but they inflate
+# the staging sysroot and with it the published artifact. Turn them on
+# locally when you actually need them.
 # BR2_ENABLE_DEBUG is not set
 BR2_GLOBAL_PATCH_DIR="${BR2_EXTERNAL_NERVES_PATH}/patches ${NERVES_DEFCONFIG_DIR}/patches"
 BR2_PACKAGE_OVERRIDE_FILE="${NERVES_DEFCONFIG_DIR}/local.mk"
@@ -228,16 +227,17 @@ BR2_PACKAGE_JPEG_TURBO=y
 
 # GPU userspace — Mesa3D / Freedreno for the in-SoC Adreno 506 (a5xx).
 # Brings up the full GL/GLES/EGL/GBM stack via the gallium freedreno
-# driver plus OpenCL through Rusticl (Mesa's Rust OpenCL frontend).
-# No Vulkan: Freedreno's turnip driver only supports a6xx+, the Adreno
-# 506 is a5xx and has no production Vulkan path.
+# driver. No Vulkan: Freedreno's turnip driver only supports a6xx+, the
+# Adreno 506 is a5xx and has no production Vulkan path.
 BR2_PACKAGE_MESA3D=y
 BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_FREEDRENO=y
 BR2_PACKAGE_MESA3D_OPENGL=y
 BR2_PACKAGE_MESA3D_OPENGL_ES=y
 BR2_PACKAGE_MESA3D_OPENGL_EGL=y
 BR2_PACKAGE_MESA3D_GBM=y
-BR2_PACKAGE_MESA3D_LLVM=y
-BR2_PACKAGE_MESA3D_OPENCL=y
-BR2_PACKAGE_MESA3D_RUSTICL=y
-BR2_PACKAGE_CLINFO=y
+# No OpenCL. Rusticl compiles kernels at runtime, so it drags clang and
+# LLVM onto the device: 177 MB of a 520 MB rootfs, which left the 250 MiB
+# rootfs partition 91% full. The a5xx compute paths in patches/mesa3d are
+# kept — GLES 3.1 compute shaders go through the same ir3 code — but the
+# OpenCL front end is not worth a third of the filesystem here. Set
+# BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL} to bring it back.
