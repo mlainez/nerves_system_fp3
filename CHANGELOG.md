@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.1.2
+
+Camera fixes for the Fairphone 3, and a release-integrity fix. Supersedes
+v0.1.1, on which the Fairphone 3 could not use either camera.
+
+### Fixed
+
+- **The Fairphone 3 had no working cameras at all.** Its rear overlay points
+  `flash-leds` at the flash controller, but `leds-qcom-flash` registers a
+  V4L2 flash subdev per *LED*, using that LED's own fwnode. Nothing ever
+  appeared for the controller, so the sensor's async notifier waited forever,
+  the CAMSS notifier never completed, and the phone booted with **no
+  `/dev/v4l-subdev*` whatsoever** — one stalled notifier takes down the whole
+  media device, so the front camera died with the rear. The Fairphone 3+ was
+  unaffected because only the IMX363 module declares a flash. Fixed by
+  labelling the LED nodes and referencing those, plus enabling
+  `CONFIG_V4L2_FLASH_LED_CLASS` — without which the driver registers a LED
+  class device and no subdev at all. Kernel `6084f591155d`.
+- **The capture tooling assumed a Fairphone 3+.** `fp3-cam-setup` hardcoded
+  the entity name `s5kgm1sp 3-0010`, 4000x3000 and GRBG, and `cam-snap`
+  hardcoded `/dev/v4l-subdev16`, 4000x3000 and `V4L2_PIX_FMT_SGRBG10P`. On a
+  Fairphone 3 every `media-ctl` call silently missed and the script still
+  reported success; `VIDIOC_STREAMON` then failed with `-EPIPE`, because
+  CAMSS checks the video node's format against the pipeline feeding it.
+  `fp3-cam-setup` now resolves the fitted module from the media graph and
+  publishes what it found to `/run/fp3-cam-{rear,front}.conf`; `cam-snap`
+  reads that instead of guessing, and derives the capture fourcc from the
+  Bayer order.
+- **The kernel config was not in the artifact checksum.** `package_files/0`
+  listed `linux-6.6.defconfig`, which does not exist — the real config is
+  `linux-6.19.defconfig`. Any kernel-config change therefore produced an
+  identical checksum, so a published artifact could be handed out for source
+  it was not built from.
+
+### Known gaps
+
+- The Fairphone 3 **front** camera still fails to stream: `csiphy_set_power`
+  reports `clock enable failed: -16` and the pipeline never powers up. Its
+  rear camera captures at the full 4032x3024, and both Fairphone 3+ cameras
+  work.
+
 ## v0.1.1
 
 First release with a published artifact. Supersedes v0.1.0, which was tagged

@@ -184,6 +184,24 @@ static int bayer_to_lib(enum bayer_pattern bp)
 }
 
 /*
+ * The capture format has to carry the same Bayer order as the pipeline.
+ * CAMSS compares the video node's format against the source pad it is
+ * fed from and fails VIDIOC_STREAMON with -EPIPE on a mismatch, so
+ * asking for GRBG from an RGGB sensor does not produce wrong colours,
+ * it produces no frame at all.
+ */
+static uint32_t bayer_to_v4l2(enum bayer_pattern bp)
+{
+	switch (bp) {
+	case BP_GRBG: return V4L2_PIX_FMT_SGRBG10P;
+	case BP_RGGB: return V4L2_PIX_FMT_SRGGB10P;
+	case BP_BGGR: return V4L2_PIX_FMT_SBGGR10P;
+	case BP_GBRG: return V4L2_PIX_FMT_SGBRG10P;
+	}
+	return V4L2_PIX_FMT_SGRBG10P;
+}
+
+/*
  * In-place black-level subtract + per-channel digital gain + radial
  * lens shading correction. LSC is approximated as a 1 + lsc_amount *
  * r²/r_max² brightness boost from center to corner — a stand-in for a
@@ -672,10 +690,67 @@ static const float CCM_SRGB[3][3] = {
 	{-0.05f, -0.35f,  1.40f},
 };
 
+/*
+ * Read back what fp3-cam-setup resolved for this slot. It has already
+ * walked the media graph and knows which module is fitted, so this is
+ * the one place the sensor's identity is established; everything here
+ * only fills in values the caller did not pass explicitly.
+ *
+ * A missing file is not an error: the caller keeps its own defaults.
+ */
+static void load_cam_conf(const char *preset,
+			  const char **dev, const char **subdev,
+			  const char **lens,
+			  unsigned int *width, unsigned int *height,
+			  enum bayer_pattern *bp, bool *bayer_explicit)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/run/fp3-cam-%s.conf", preset);
+
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		char *eq = strchr(line, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		char *key = line, *val = eq + 1;
+
+		val[strcspn(val, "\r\n")] = '\0';
+		size_t vlen = strlen(val);
+		if (vlen >= 2 && val[0] == '\'' && val[vlen - 1] == '\'') {
+			val[vlen - 1] = '\0';
+			val++;
+		}
+		if (!*val)
+			continue;
+
+		if (!strcmp(key, "VIDEO")) {
+			if (!*dev) *dev = strdup(val);
+		} else if (!strcmp(key, "SUBDEV")) {
+			if (!*subdev) *subdev = strdup(val);
+		} else if (!strcmp(key, "LENS")) {
+			if (!*lens) *lens = strdup(val);
+		} else if (!strcmp(key, "WIDTH")) {
+			if (!*width) *width = (unsigned int)strtoul(val, NULL, 10);
+		} else if (!strcmp(key, "HEIGHT")) {
+			if (!*height) *height = (unsigned int)strtoul(val, NULL, 10);
+		} else if (!strcmp(key, "BAYER")) {
+			if (!*bayer_explicit && parse_bayer(val, bp) == 0)
+				*bayer_explicit = true;
+		}
+	}
+	fclose(f);
+}
+
 int main(int argc, char **argv)
 {
 	const char *dev = NULL, *subdev = NULL, *out = NULL, *lens = NULL;
 	unsigned int width = 0, height = 0;
+	bool bayer_explicit = false;
 	int quality = 90, exposure = -1, gain = -1, focus = -1;
 	int avg_frames = 1;
 	float gamma_val = GAMMA;
@@ -726,6 +801,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bayer") && i+1 < argc) {
 			if (parse_bayer(argv[++i], &bp))
 				die("--bayer expects grbg/rggb/bggr/gbrg");
+			bayer_explicit = true;
 		}
 		else if (!strcmp(a, "--awb")) do_awb = true;
 		else if (!strcmp(a, "--ccm")) do_ccm = true;
@@ -762,6 +838,23 @@ int main(int argc, char **argv)
 	 * value. Verified subdev numbers for the FP3+ stock kernel — if
 	 * the kernel build changes their order, override with --device etc. */
 	if (camera_preset) {
+		/* Configure the pipeline first, then take the geometry, Bayer
+		 * order and subdev nodes from what fp3-cam-setup actually
+		 * found. The camera modules are user-replaceable and the two
+		 * phone generations fit different sensors in the same slot, so
+		 * none of this can be a constant: the rear slot is a 4032x3024
+		 * RGGB IMX363 on one phone and a 4000x3000 GRBG S5KGM1SP on the
+		 * other, and even /dev/v4l-subdevN shifts between them. */
+		char setup_cmd[128];
+		snprintf(setup_cmd, sizeof(setup_cmd),
+			 "/usr/bin/fp3-cam-setup %s 1>&2", camera_preset);
+		int setup_rc = system(setup_cmd);
+		if (setup_rc != 0)
+			fprintf(stderr, "cam-snap: fp3-cam-setup returned %d (continuing)\n",
+				setup_rc);
+		load_cam_conf(camera_preset, &dev, &subdev, &lens,
+			      &width, &height, &bp, &bayer_explicit);
+
 		if (!strcmp(camera_preset, "rear")) {
 			if (!dev)    dev    = "/dev/video0";
 			if (!subdev) subdev = "/dev/v4l-subdev16";
@@ -788,17 +881,6 @@ int main(int argc, char **argv)
 
 	if (!dev || !out || !width || !height) { fputs(USAGE, stderr); return 1; }
 	if (width % 4 != 0) die("width must be a multiple of 4");
-
-	/* Ensure the CAMSS pipeline is set to full sensor resolution. Needed
-	 * because cam-stream may have left the subdevs in binned mode. */
-	if (camera_preset) {
-		char setup_cmd[128];
-		snprintf(setup_cmd, sizeof(setup_cmd),
-			 "/usr/bin/fp3-cam-setup %s 1>&2", camera_preset);
-		int rc = system(setup_cmd);
-		if (rc != 0)
-			fprintf(stderr, "cam-snap: fp3-cam-setup returned %d (continuing)\n", rc);
-	}
 
 	signal(SIGPIPE, SIG_IGN);
 	build_gamma_lut(gamma_val, contrast);
@@ -844,7 +926,7 @@ int main(int argc, char **argv)
 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	fmt.fmt.pix_mp.width = width;
 	fmt.fmt.pix_mp.height = height;
-	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_SGRBG10P;
+	fmt.fmt.pix_mp.pixelformat = bayer_to_v4l2(bp);
 	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	fmt.fmt.pix_mp.num_planes = 1;
 	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) die("VIDIOC_S_FMT: %s", strerror(errno));

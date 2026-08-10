@@ -106,7 +106,7 @@ defmodule NervesSystemFP3.MixProject do
       "fwup_include",
       "fwup-ops.conf",
       "fwup.conf",
-      "linux-6.6.defconfig",
+      "linux-6.19.defconfig",
       "busybox-fp3.fragment",
       "Config.in",
       "external.mk",

@@ -16,7 +16,7 @@ Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 | Wi-Fi / BT   | wcnss/prima via remoteproc, BlueZ userspace                 |
 | NFC          | Yes                                                         |
 | GNSS         | Yes                                                         |
-| Camera       | Front + rear through CAMSS to V4L2                          |
+| Camera       | Rear + front through CAMSS to V4L2 (see Known gaps)         |
 | Audio        | Loudspeaker via ADSP                                        |
 | Sensors      | Qualcomm ADSP sensor stack, exposed through IIO             |
 
@@ -218,6 +218,9 @@ prompt there.
   convolution trips an IR3 shader hang, so the workloads that motivated it
   ran faster on the CPU anyway. Re-enable
   `BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL}` if you need it.
+- The Fairphone 3 front camera does not stream: CSIPHY power-up fails with
+  `clock enable failed: -16`. Its rear camera works at 4032x3024, and both
+  Fairphone 3+ cameras work.
 - GPS XTRA assistance data is not downloaded.
 - The USB gadget IDs in `packages/citronics-initramfs/deviceinfo` are the
   generic Google ones; a product should use its own.
