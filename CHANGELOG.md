@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.1
+
+First release with a published artifact. Supersedes v0.1.0, which was tagged
+but never released and carried two defects fixed here.
+
+### Fixed
+
+- **The loudspeaker went silent a few minutes after boot, on both phones.**
+  The modem firmware programs TLMM directly, remuxing GPIO 22/23 — i2c-6
+  SDA/SCL, the bus the speaker amplifier sits on — from `blsp_i2c6` to plain
+  GPIO driving low. With both lines held down, every register access to the
+  amplifier failed as a bus error, so the AW8898 of the Fairphone 3 and the
+  TAS2557 of the Fairphone 3+ died identically; it only looked like a codec
+  bug. Linux never noticed, because pinctrl still believed its default state
+  was applied and so refused to re-apply it. `i2c-qup` now alternates between
+  the sleep and default pin states across its runtime PM cycle, which forces
+  mux, bias and drive strength back to hardware before the first transfer
+  after every idle period. Kernel `c3f8be7c3799`.
+- **The artifact was 6.8 GB.** `BR2_ENABLE_DEBUG` is off, which takes it to
+  637 MB; LLVM alone had shipped 977 MB of debug info for Rusticl's runtime
+  OpenCL compiler.
+
 ## v0.1.0
 
 First public release. Nerves system for the Fairphone 3 and Fairphone 3+
