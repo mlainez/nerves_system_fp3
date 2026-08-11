@@ -16,7 +16,7 @@ Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 | Wi-Fi / BT   | wcnss/prima via remoteproc, BlueZ userspace                 |
 | NFC          | Yes                                                         |
 | GNSS         | Yes                                                         |
-| Camera       | Rear + front through CAMSS to V4L2                          |
+| Camera       | Rear + front: stills and live H.264 (Venus) through CAMSS   |
 | Audio        | Loudspeaker via ADSP                                        |
 | Sensors      | Qualcomm ADSP sensor stack, exposed through IIO             |
 
@@ -198,9 +198,14 @@ up cellular data. Wi-Fi is `wpa_supplicant` + VintageNet.
 **Audio.** `aplay -D plughw:0,0 file.wav`. The amplifier firmware comes from
 the `fp3-firmware` package.
 
-**Camera.** `fp3-cam-setup` configures the CAMSS media graph; `cam-snap`,
-`cam-stream` and `cam-grab` capture stills, H.264 and raw Bayer. Demosaicing
-is done in software — the msm8953 CPP hardware ISP is not driven.
+**Camera.** `fp3-cam-setup` configures the CAMSS media graph and resolves
+the fitted module from it — nothing is keyed on slot or on `/dev/videoN`,
+which move between phones and between boots. `cam-snap`, `cam-stream` and
+`cam-grab` capture stills, H.264 and raw Bayer; the
+[`fp3_camera`](https://github.com/mlainez/fp3_camera) library drives them
+from Elixir. Demosaicing is done in software — the msm8953 CPP hardware
+ISP is not driven. Streams are raw H.264 over TCP, so a browser cannot
+open them; use `ffplay tcp://…`.
 
 **Sensors.** The Qualcomm stack runs on the ADSP and surfaces under
 `/sys/bus/iio/devices/`.
@@ -218,6 +223,12 @@ prompt there.
   convolution trips an IR3 shader hang, so the workloads that motivated it
   ran faster on the CPU anyway. Re-enable
   `BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL}` if you need it.
+- Venus can wedge mid-stream (`wait for cpu and video core idle fail`).
+  `fp3_camera` detects the stall and restarts the stream, but the
+  underlying fault is not understood.
+- Camera colour is close to Android's but not calibrated against a known
+  target; streams centre-crop rather than scale, so they see about 30%
+  less vertical field of view than a still from the same camera.
 - GPS XTRA assistance data is not downloaded.
 - The USB gadget IDs in `packages/citronics-initramfs/deviceinfo` are the
   generic Google ones; a product should use its own.

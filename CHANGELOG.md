@@ -2,59 +2,130 @@
 
 ## v0.1.3
 
-Both cameras work on both phones. Supersedes v0.1.2, on which the
-Fairphone 3's front camera could not stream.
+Both cameras work on both phones, stills and live H.264, and the
+streaming path is no longer flaky. Supersedes v0.1.2, on which the
+Fairphone 3's front camera could not stream at all.
 
-### Fixed
+### Fixed — cameras
 
-Three independent bugs sat on top of one another here; each one hid the
-next, and the first two are kernel bugs that affect more than this board.
+Five independent faults sat between "a camera exists" and "you can watch
+it", each hiding the next.
 
 - **The CSIPHY could not power up for the front sensor.**
   `csi{0,1,2}phytimer_clk_src` pointed at the wrong GPLL0_DIV2 mux index
   — 2, where Qualcomm's own driver programs 4. Only the 100 MHz rate is
   sourced from that parent, so the fault stayed invisible until a sensor
-  asked for it: CAMSS derives the timer rate from the sensor's link
-  frequency, every other msm8953 sensor in tree lands on 200 MHz, and the
-  Fairphone 3's 350 MHz front sensor is the first device to reach the
-  100 MHz rung. The RCG was pointed at an input carrying no clock, so the
-  branch never un-halted and `clk_prepare_enable()` returned `-EBUSY`.
-  Kernel `c6e7d2b9d9c5`.
+  asked for it: every other msm8953 sensor in tree lands on 200 MHz, and
+  the Fairphone 3's 350 MHz front sensor is the first device to reach the
+  100 MHz rung. Kernel `c6e7d2b9d9c5`.
 
 - **The front camera's 1.2 V rail was never actually switched on.**
   `regulator-fixed` asserts its enable GPIO's output-enable once, at
-  probe; afterwards the core only ever writes the pin's *data* register,
-  and `_regulator_is_enabled()` reports a software flag. The modem on
-  this SoC programs TLMM directly and clears the output-enable on the
-  pins of QDSS trace bus B — which is where GPIO 46 lives, along with the
-  i2c-6 pair 22/23 already known to kill the loudspeaker. The rail
-  therefore read as enabled while its pin had quietly become an undriven
-  input, and the sensor answered nothing on CCI. The regulator core now
-  re-asserts the direction on every enable. Kernel `0dcf16c4a8fc`.
+  probe; afterwards the core only writes the pin's *data* register, while
+  `_regulator_is_enabled()` reports a software flag. The modem programs
+  TLMM directly and clears the output-enable on the pins of QDSS trace
+  bus B, where GPIO 46 lives. The rail read as enabled while its pin had
+  quietly become an undriven input. Kernel `0dcf16c4a8fc`.
+
+- **The Fairphone 3+ front camera returned pure noise at full
+  resolution.** Its driver declared half the real MIPI link frequency,
+  for the 4608x3456 mode only: `OP_SYS_CLK_DIV` is 0 for full res and 1
+  for binned, and the formula applied `/2` to both. CAMSS sizes the VFE
+  clock from the pixel rate, so 292.8 Mpix/s selected the 100 MHz rung
+  where 585.6 needs 160 — the RDI path drained at roughly 427 Mpix/s
+  against 507 delivered, and every frame overflowed. Nothing in the RDI
+  path validates anything, so no error appeared anywhere. Binned was
+  declared correctly and always worked, which is what made it look like
+  a sensor fault. Kernel `6.19/staging b91c46147a38`.
+
+- **The H.264 encoder was never present.** `venus-core` binds the Venus
+  device from its device-tree compatible and then creates child platform
+  devices for the decoder and encoder that have no DT node of their own,
+  so nothing autoloads `venus-enc`/`venus-dec` and they sit unbound
+  forever. `fp3-cam-setup` now loads them. Building the media stack into
+  the kernel does not fix this and makes it worse: a built-in
+  `venus-core` probes before the rootfs is mounted and cannot load its
+  firmware at all.
 
 - **The capture tooling opened the wrong video node.** `fp3-cam-setup`
   hardcoded `/dev/video0` and `/dev/video1`, but CAMSS registers its
   video nodes alongside Venus and the numbers move between phones and
-  between boots — measured as rear `/dev/video2` and front `/dev/video3`
-  on a Fairphone 3 while a Fairphone 3+ had `/dev/video0` and
-  `/dev/video1`. The pipeline was configured on one RDI lane while frames
-  were read from another, and `VIDIOC_STREAMON` failed with a silent
-  `-EPIPE`. The node is now resolved from the media graph, like the
-  sensor entity, its subdev and the lens already were.
+  between boots. The pipeline was configured on one RDI lane while
+  frames were read from another, and `VIDIOC_STREAMON` failed with a
+  silent `-EPIPE`.
 
-Also included: `s5k4h7yx` now issues a software reset before loading its
-register set, matching every vendor table and the S5K3P9SP sibling.
+### Fixed — streaming
+
+- **Live streams lagged 2-3 seconds behind.** The frame pacer was
+  disabled, so the pipeline ran at whatever the sensor and encoder
+  managed — 43-45 fps into a stream the player treats as 30. The player
+  falls a third of a second behind every second and the lag grows
+  without bound. Pacing is against a fixed cadence; naive
+  time-since-last-submit pacing rejects frames arriving marginally early
+  and compounds, measuring 24.5 fps out of a 30 fps sensor. Now 30.0 fps
+  at 20 ms sensor-to-socket on both phones.
+
+- **The Fairphone 3's front stream sheared into diagonal noise.** Venus
+  wants its NV12 input width a multiple of 128. That camera bins to 1440
+  and lands on 1424, which the driver silently padded to 1536 while the
+  writer kept producing 1424-wide rows. Every other camera bins to at
+  least 1920 and caps at 1920 = 15x128, so the fault appeared on exactly
+  one camera. `cam-stream` now refuses to start rather than emit a
+  sheared picture.
+
+- **Stopping a stream wedged Venus.** `cam-stream` handled SIGINT but not
+  SIGTERM, which is what the library sends, so the default action killed
+  it before `VIDIOC_STREAMOFF` ran and left the encoder streaming into
+  freed buffers. The next run hit `wait for cpu and video core idle fail
+  (-110)`, which takes CAMSS down with it and stops stills working too.
+  That was long blamed on the Venus driver.
+
+- **Teardown now insists.** SIGTERM, then SIGKILL, then wait until the
+  port can actually be bound. A wedged Venus ioctl never reaches the
+  signal handler, so a restart used to collide with its own corpse and
+  fail on `bind: Address already in use`.
+
+- **Failures are reported instead of hidden.** `start_stream/2` watches
+  the child long enough to catch a bind failure and returns an error
+  with the child's own message, rather than an `{:ok, ref}` that
+  `stop_stream/1` later rejects as `:not_found`. Stalled streams are
+  detected from the encoder's frame heartbeat and restarted, and both
+  binaries set `PR_SET_PDEATHSIG` so an orphan cannot outlive the VM
+  holding its port.
+
+### Fixed — device identity
+
+`/etc/boardid.config` read `-n 8` where it meant `-l 8`, and ended in
+`|| true`, which is shell syntax in a file that is not shell. Every FP3
+answered `"0"`: hostname `nerves-0` on every device, and because
+VintageNetDirect hashes the hostname to pick its `/30`, two phones on one
+host claimed the same address. It now reads the Qualcomm SoC serial,
+falling back to the eMMC CID — which is what actually answers, because
+the SoC serial is not populated yet when erlinit builds the hostname.
 
 ### Verified
 
-Six rounds over ~46 minutes of uptime, on a clean build of the pinned
-kernel SHA, driven through both the `cam-snap` CLI and the `fp3_camera`
-Elixir library: 24 captures, no failures, no reboots.
+Both phones, all four camera modules, stills and live H.264, from a
+clean build at the pinned kernel SHA. Every frame was decoded and
+checked for row correlation rather than trusted on byte count — noise
+scores 0.58-0.80 on that measure, real images 0.98 and above.
 
 | | Fairphone 3 | Fairphone 3+ |
 | --- | --- | --- |
-| Rear | 4032x3024 (IMX363) | 4000x3000 (S5KGM1SP) |
-| Front | 3264x2448 (S5K4H7YX) | 4608x3456 (S5K3P9SP) |
+| Rear | 4032x3024 IMX363, 0.993 | 4000x3000 S5KGM1SP, 0.997 |
+| Front | 3264x2448 S5K4H7YX, 0.983 | 4608x3456 S5K3P9SP, 0.989 |
+
+### Known gaps
+
+- Venus can still wedge mid-stream (`wait for cpu and video core idle
+  fail`). The stall detector now catches it and restarts the stream, but
+  the underlying fault is not understood.
+- Colour is close to Android's on all four sensors but is not calibrated
+  against a known target under known illuminants.
+- Streams centre-crop rather than scale, so they see roughly 30% less
+  vertical field of view than a still from the same camera.
+- Auto-exposure runs out of range on the FP3+ front at full resolution
+  in dim light.
 
 ## v0.1.2
 
