@@ -30,6 +30,25 @@ set +e
 
 MEDIA=/dev/media0
 
+# The H.264 encoder has to be pulled in by hand.
+#
+# venus-core binds 1d00000.venus from its OF compatible, and then creates
+# two child platform devices for the decoder and the encoder. Those
+# children have no device-tree node, so nothing generates a uevent that
+# would autoload venus-enc/venus-dec, and they sit UNBOUND forever:
+# `sync_state() pending due to 1d00000.venus:video-encoder` in dmesg, no
+# /dev/video for the encoder, and cam-stream exits with "no V4L2 H.264
+# m2m encoder found" the moment a client connects.
+#
+# Building the media stack into the kernel does not fix this and breaks
+# more than it mends: a built-in venus-core probes before the rootfs is
+# mounted, cannot load venus.mdt from /lib/firmware, and then the whole
+# device fails to probe rather than just its children. Measured — both
+# phones came up with no venus at all. Modules load after userspace is
+# up, so the firmware is there; they just need asking for.
+modprobe venus-enc 2>/dev/null
+modprobe venus-dec 2>/dev/null
+
 mc_link() { media-ctl -d "$MEDIA" -l "$1" >/dev/null 2>&1; }
 mc_fmt()  { media-ctl -d "$MEDIA" -V "$1" >/dev/null 2>&1; }
 
