@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.1.3
+
+Both cameras work on both phones. Supersedes v0.1.2, on which the
+Fairphone 3's front camera could not stream.
+
+### Fixed
+
+Three independent bugs sat on top of one another here; each one hid the
+next, and the first two are kernel bugs that affect more than this board.
+
+- **The CSIPHY could not power up for the front sensor.**
+  `csi{0,1,2}phytimer_clk_src` pointed at the wrong GPLL0_DIV2 mux index
+  — 2, where Qualcomm's own driver programs 4. Only the 100 MHz rate is
+  sourced from that parent, so the fault stayed invisible until a sensor
+  asked for it: CAMSS derives the timer rate from the sensor's link
+  frequency, every other msm8953 sensor in tree lands on 200 MHz, and the
+  Fairphone 3's 350 MHz front sensor is the first device to reach the
+  100 MHz rung. The RCG was pointed at an input carrying no clock, so the
+  branch never un-halted and `clk_prepare_enable()` returned `-EBUSY`.
+  Kernel `c6e7d2b9d9c5`.
+
+- **The front camera's 1.2 V rail was never actually switched on.**
+  `regulator-fixed` asserts its enable GPIO's output-enable once, at
+  probe; afterwards the core only ever writes the pin's *data* register,
+  and `_regulator_is_enabled()` reports a software flag. The modem on
+  this SoC programs TLMM directly and clears the output-enable on the
+  pins of QDSS trace bus B — which is where GPIO 46 lives, along with the
+  i2c-6 pair 22/23 already known to kill the loudspeaker. The rail
+  therefore read as enabled while its pin had quietly become an undriven
+  input, and the sensor answered nothing on CCI. The regulator core now
+  re-asserts the direction on every enable. Kernel `0dcf16c4a8fc`.
+
+- **The capture tooling opened the wrong video node.** `fp3-cam-setup`
+  hardcoded `/dev/video0` and `/dev/video1`, but CAMSS registers its
+  video nodes alongside Venus and the numbers move between phones and
+  between boots — measured as rear `/dev/video2` and front `/dev/video3`
+  on a Fairphone 3 while a Fairphone 3+ had `/dev/video0` and
+  `/dev/video1`. The pipeline was configured on one RDI lane while frames
+  were read from another, and `VIDIOC_STREAMON` failed with a silent
+  `-EPIPE`. The node is now resolved from the media graph, like the
+  sensor entity, its subdev and the lens already were.
+
+Also included: `s5k4h7yx` now issues a software reset before loading its
+register set, matching every vendor table and the S5K3P9SP sibling.
+
+### Verified
+
+Six rounds over ~46 minutes of uptime, on a clean build of the pinned
+kernel SHA, driven through both the `cam-snap` CLI and the `fp3_camera`
+Elixir library: 24 captures, no failures, no reboots.
+
+| | Fairphone 3 | Fairphone 3+ |
+| --- | --- | --- |
+| Rear | 4032x3024 (IMX363) | 4000x3000 (S5KGM1SP) |
+| Front | 3264x2448 (S5K4H7YX) | 4608x3456 (S5K3P9SP) |
+
 ## v0.1.2
 
 Camera fixes for the Fairphone 3, and a release-integrity fix. Supersedes
