@@ -56,6 +56,23 @@
 #define OUT_W   1920
 #define OUT_H   1080
 
+/*
+ * The Bayer phase of the fitted sensor, and the encoder's frame size.
+ *
+ * A Bayer pattern differs from GRBG only by where the 2x2 tile starts,
+ * so rather than teaching the demosaic four phases we shift the crop
+ * origin by 0 or 1 pixel and let the existing GRBG path do the work:
+ *   GRBG (0,0)   RGGB (1,0)   BGGR (0,1)   GBRG (1,1)
+ * The crop is even-aligned, so adding these keeps the phase exact.
+ *
+ * The output size cannot be a constant either: the Fairphone 3's front
+ * sensor binned is 1440x1080, narrower than 1920, so a fixed 1920-wide
+ * frame is unreachable there. Derived from the source in main().
+ */
+static int g_phase_dx = 0, g_phase_dy = 0;
+static uint32_t g_cap_fourcc = V4L2_PIX_FMT_SGRBG10P;
+static int g_out_w = OUT_W, g_out_h = OUT_H;
+
 /* Sized so two concurrent cam-stream instances (front + rear) don't
  * starve the CAMSS write-master IRQs. With CAP_BUFS=4 the kernel was
  * logging "qcom-camss: Missing ready buf 0 5!" whenever Venus took a
@@ -116,7 +133,7 @@ static int cap_open_and_setup(const char *dev, const char *subdev,
 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	fmt.fmt.pix_mp.width = width;
 	fmt.fmt.pix_mp.height = height;
-	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_SGRBG10P;  /* 'pgAA' */
+	fmt.fmt.pix_mp.pixelformat = g_cap_fourcc;  /* set from the sensor's Bayer order */
 	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	fmt.fmt.pix_mp.num_planes = 1;
 	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
@@ -177,7 +194,7 @@ static int cap_open_and_setup(const char *dev, const char *subdev,
  * and /dev/videoN and /dev/v4l-subdevN are renumbered per boot.
  */
 static void load_cam_conf(const char *cam, const char **dev, const char **subdev,
-			  int *w, int *h)
+			  int *w, int *h, char *bayer, size_t bayerlen)
 {
 	static char devbuf[64], subbuf[64];
 	char path[64];
@@ -207,6 +224,8 @@ static void load_cam_conf(const char *cam, const char **dev, const char **subdev
 			*w = atoi(v);
 		} else if (!strcmp(k, "HEIGHT") && *v) {
 			*h = atoi(v);
+		} else if (!strcmp(k, "BAYER") && *v) {
+			snprintf(bayer, bayerlen, "%s", v);
 		}
 	}
 	fclose(f);
@@ -278,8 +297,8 @@ static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 	/* OUTPUT (input frames): NV12 1920x1080 */
 	struct v4l2_format fmt = {0};
 	fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-	fmt.fmt.pix_mp.width = OUT_W;
-	fmt.fmt.pix_mp.height = OUT_H;
+	fmt.fmt.pix_mp.width = g_out_w;
+	fmt.fmt.pix_mp.height = g_out_h;
 	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
 	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	fmt.fmt.pix_mp.num_planes = 1;
@@ -289,8 +308,8 @@ static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 	/* CAPTURE (encoded bitstream): H.264 */
 	memset(&fmt, 0, sizeof(fmt));
 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	fmt.fmt.pix_mp.width = OUT_W;
-	fmt.fmt.pix_mp.height = OUT_H;
+	fmt.fmt.pix_mp.width = g_out_w;
+	fmt.fmt.pix_mp.height = g_out_h;
 	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
 	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	fmt.fmt.pix_mp.num_planes = 1;
@@ -353,7 +372,7 @@ static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 		 * thick green band at the bottom of the decoded stream. Pre-
 		 * init the buffer to a neutral NV12 black so any unwritten
 		 * region looks like padding, not garbage. */
-		size_t y_bytes = (size_t)OUT_W * OUT_H;
+		size_t y_bytes = (size_t)g_out_w * g_out_h;
 		if (y_bytes <= outs[i].len) {
 			memset(outs[i].p, 0, y_bytes);                /* Y plane = 0 */
 			memset(outs[i].p + y_bytes, 128, outs[i].len - y_bytes); /* UV plane = 128 neutral */
@@ -623,8 +642,8 @@ static void bayer_to_nv12(const uint8_t *bayer_packed, uint8_t *nv12,
 {
 	const int W = bayer_w;
 	const int H = bayer_h;
-	const int crop_x = ((bayer_w - out_w) / 2) & ~1;
-	const int crop_y = ((bayer_h - out_h) / 2) & ~1;
+	const int crop_x = (((bayer_w - out_w) / 2) & ~1) + g_phase_dx;
+	const int crop_y = (((bayer_h - out_h) / 2) & ~1) + g_phase_dy;
 	uint8_t *yp  = nv12;
 	uint8_t *uvp = nv12 + (size_t)out_w * out_h;
 
@@ -1155,7 +1174,34 @@ int main(int argc, char **argv)
 			fprintf(stderr, "cam-stream: fp3-cam-setup returned %d (continuing)\n", rc);
 
 		/* Adopt whatever it resolved, rather than the defaults above. */
-		load_cam_conf(cam_name, &cam_dev, &cam_subdev, &cam_w, &cam_h);
+		char bayer[8] = "grbg";
+		load_cam_conf(cam_name, &cam_dev, &cam_subdev, &cam_w, &cam_h,
+			      bayer, sizeof(bayer));
+
+		/* Bayer order decides both the capture fourcc and the crop
+		 * phase that normalises the sensor to the GRBG demosaic. */
+		if (!strcmp(bayer, "rggb")) {
+			g_cap_fourcc = V4L2_PIX_FMT_SRGGB10P;
+			g_phase_dx = 1; g_phase_dy = 0;
+		} else if (!strcmp(bayer, "bggr")) {
+			g_cap_fourcc = V4L2_PIX_FMT_SBGGR10P;
+			g_phase_dx = 0; g_phase_dy = 1;
+		} else if (!strcmp(bayer, "gbrg")) {
+			g_cap_fourcc = V4L2_PIX_FMT_SGBRG10P;
+			g_phase_dx = 1; g_phase_dy = 1;
+		} else {
+			g_cap_fourcc = V4L2_PIX_FMT_SGRBG10P;
+			g_phase_dx = 0; g_phase_dy = 0;
+		}
+
+		/* Largest 16-aligned frame that fits the source, capped at
+		 * 1080p. The phase offset costs a pixel, hence the -1. */
+		int fit_w = (cam_w - 1) & ~15;
+		int fit_h = (cam_h - 1) & ~15;
+		g_out_w = fit_w < OUT_W ? fit_w : OUT_W;
+		g_out_h = fit_h < OUT_H ? fit_h : OUT_H;
+		fprintf(stderr, "cam-stream: bayer=%s out=%dx%d\n",
+			bayer, g_out_w, g_out_h);
 	}
 
 	signal(SIGINT, on_sigint);
@@ -1234,7 +1280,7 @@ int main(int argc, char **argv)
 	 * to `ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -r 30 -i -` and
 	 * let ffmpeg do everything else (encode, mux, stream). */
 	if (out_nv12) {
-		uint8_t *nv12 = malloc((size_t)OUT_W * OUT_H * 3 / 2);
+		uint8_t *nv12 = malloc((size_t)g_out_w * g_out_h * 3 / 2);
 		if (!nv12) die("malloc nv12");
 		double t0 = now_s();
 		int fc = 0;
@@ -1264,9 +1310,9 @@ int main(int argc, char **argv)
 			pthread_mutex_unlock(&ctrl.mu);
 			bayer_to_nv12(cap_bufs[cb.index].p, nv12,
 				      cam_w, cam_h, cap_bytesperline,
-				      OUT_W, OUT_H,
+				      g_out_w, g_out_h,
 				      wb_r_q8, wb_b_q8, sat_q8);
-			size_t left = (size_t)OUT_W * OUT_H * 3 / 2;
+			size_t left = (size_t)g_out_w * g_out_h * 3 / 2;
 			uint8_t *p = nv12;
 			while (left > 0) {
 				ssize_t w = write(sink_fd, p, left);
@@ -1292,7 +1338,7 @@ int main(int argc, char **argv)
 
 	fprintf(stderr,
 		"cam-stream: cap=%s %dx%d → enc=/dev/video7 %dx%d H.264 %dbps\n",
-		cam_dev, cam_w, cam_h, OUT_W, OUT_H, bitrate);
+		cam_dev, cam_w, cam_h, g_out_w, g_out_h, bitrate);
 
 	/* All enc OUTPUT buffers are free initially. We track that with a
 	 * simple free-list: enc_out_free[i] = 1 means buffer i is available
@@ -1436,7 +1482,7 @@ int main(int argc, char **argv)
 			bayer_to_nv12(cap_bufs[cb.index].p,
 				      enc_out_bufs[oi].p,
 				      cam_w, cam_h, cap_bytesperline,
-				      OUT_W, OUT_H,
+				      g_out_w, g_out_h,
 				      wb_r_q8, wb_b_q8, sat_q8);
 
 			/* Queue NV12 to encoder.
@@ -1444,7 +1490,7 @@ int main(int argc, char **argv)
 			 * for its rate controller — without them it produces
 			 * only one I-frame and goes silent. */
 			struct v4l2_plane opl = {0};
-			opl.bytesused = OUT_W * OUT_H * 3 / 2;
+			opl.bytesused = g_out_w * g_out_h * 3 / 2;
 			opl.length = enc_out_bufs[oi].len;
 			struct v4l2_buffer ob = {0};
 			ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
