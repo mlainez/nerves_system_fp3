@@ -72,6 +72,12 @@
  */
 static int g_phase_dx = 0, g_phase_dy = 0;
 static uint32_t g_cap_fourcc = V4L2_PIX_FMT_SGRBG10P;
+/* Venus NV12 input alignment. bayer_to_nv12() writes tightly packed rows
+ * of g_out_w bytes, so the encoder must not pad the width — see the size
+ * computation in main() for what padding does to the picture. */
+#define ENC_ALIGN_W 128
+#define ENC_ALIGN_H 32
+
 static int g_out_w = OUT_W, g_out_h = OUT_H;
 
 /* Sized so two concurrent cam-stream instances (front + rear) don't
@@ -316,6 +322,20 @@ static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 	fmt.fmt.pix_mp.num_planes = 1;
 	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
 		die("enc OUTPUT S_FMT: %s", strerror(errno));
+
+	/* S_FMT returns what the driver actually chose. If it widened the
+	 * buffer, every row we write lands at the wrong offset and the
+	 * output shears — so say so and stop, rather than serve a stream
+	 * that has valid NAL units and an unreadable picture. Counting
+	 * keyframes does not catch this; only looking at a decoded frame
+	 * does, which is exactly how it went unnoticed. */
+	if ((int)fmt.fmt.pix_mp.width != g_out_w ||
+	    (int)fmt.fmt.pix_mp.plane_fmt[0].bytesperline > g_out_w) {
+		die("encoder padded %dx%d to %ux%u (stride %u); "
+		    "pick a width that is a multiple of %d",
+		    g_out_w, g_out_h, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
+		    fmt.fmt.pix_mp.plane_fmt[0].bytesperline, ENC_ALIGN_W);
+	}
 
 	/* CAPTURE (encoded bitstream): H.264 */
 	memset(&fmt, 0, sizeof(fmt));
@@ -1206,12 +1226,27 @@ int main(int argc, char **argv)
 			g_phase_dx = 0; g_phase_dy = 0;
 		}
 
-		/* Largest 16-aligned frame that fits the source, capped at
-		 * 1080p. The phase offset costs a pixel, hence the -1. */
-		int fit_w = (cam_w - 1) & ~15;
-		int fit_h = (cam_h - 1) & ~15;
-		g_out_w = fit_w < OUT_W ? fit_w : OUT_W;
-		g_out_h = fit_h < OUT_H ? fit_h : OUT_H;
+		/* Largest frame that fits the source, capped at 1080p. The
+		 * phase offset costs a pixel, hence the -1.
+		 *
+		 * The alignment is Venus's, not ours. Its NV12 input wants
+		 * the width a multiple of ENC_ALIGN_W and the height a
+		 * multiple of ENC_ALIGN_H; ask for anything else and the
+		 * driver quietly pads the buffer, while bayer_to_nv12() goes
+		 * on writing rows at out_w. Every row then starts a little
+		 * early and the picture shears into diagonal noise.
+		 *
+		 * Only the *width* does that — extra rows at the bottom are
+		 * just unwritten black. Which is why this stayed hidden: the
+		 * FP3 rear, and both FP3+ cameras, bin to at least 1920 and
+		 * get capped to 1920 = 15 x 128, already aligned. The FP3
+		 * front bins to 1440, lands on 1424, and Venus pads it to
+		 * 1536. It was the one torn stream, and it looked for all the
+		 * world like a broken sensor. */
+		int fit_w = (cam_w - 1) & ~(ENC_ALIGN_W - 1);
+		int fit_h = (cam_h - 1) & ~(ENC_ALIGN_H - 1);
+		g_out_w = fit_w < OUT_W ? fit_w : (OUT_W & ~(ENC_ALIGN_W - 1));
+		g_out_h = fit_h < OUT_H ? fit_h : (OUT_H & ~(ENC_ALIGN_H - 1));
 		fprintf(stderr, "cam-stream: bayer=%s out=%dx%d\n",
 			bayer, g_out_w, g_out_h);
 	}

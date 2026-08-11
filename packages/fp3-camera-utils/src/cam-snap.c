@@ -670,7 +670,8 @@ static const char *USAGE =
 	"               [--frames 1..9]              multi-frame averaging\n"
 	"               [--exposure N] [--gain N]\n"
 	"               [--bayer grbg|rggb|bggr|gbrg]   (default grbg)\n"
-	"               [--awb]                         (gray-world AWB)\n"
+	"               [--awb]                         (gray-world AWB, the default)\n"
+	"               [--no-awb]                      (use the built-in per-slot gains instead)\n"
 	"               [--wb R G B]                    (manual gains; overrides --awb)\n"
 	"               [--warm-bias 1.05]              (R-gain multiplier; LED+fluo are green-biased)\n"
 	"               [--ccm]                         (apply built-in sRGB matrix)\n"
@@ -701,7 +702,7 @@ static const float CCM_SRGB[3][3] = {
  */
 static void load_cam_conf(const char *preset,
 			  const char **dev, const char **subdev,
-			  const char **lens,
+			  const char **lens, const char **sensor,
 			  unsigned int *width, unsigned int *height,
 			  enum bayer_pattern *bp, bool *bayer_explicit)
 {
@@ -729,7 +730,9 @@ static void load_cam_conf(const char *preset,
 		if (!*val)
 			continue;
 
-		if (!strcmp(key, "VIDEO")) {
+		if (!strcmp(key, "SENSOR")) {
+			if (!*sensor) *sensor = strdup(val);
+		} else if (!strcmp(key, "VIDEO")) {
 			if (!*dev) *dev = strdup(val);
 		} else if (!strcmp(key, "SUBDEV")) {
 			if (!*subdev) *subdev = strdup(val);
@@ -783,6 +786,7 @@ int main(int argc, char **argv)
 	float saturation = 1.50f;  /* chroma boost; 1.0=neutral, 1.5≈ref2 pop */
 	bool use_phone_curve = false;  /* histogram-matched Android-look LUTs */
 	const char *camera_preset = NULL;
+	const char *sensor = NULL;   /* the fitted part, from /run/fp3-cam-*.conf */
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -804,7 +808,13 @@ int main(int argc, char **argv)
 				die("--bayer expects grbg/rggb/bggr/gbrg");
 			bayer_explicit = true;
 		}
-		else if (!strcmp(a, "--awb")) do_awb = true;
+		/* --awb has to clear manual_wb: the WB branch below tests
+		 * manual_wb first, and it defaults to true, so the flag used
+		 * to set do_awb and then be ignored entirely. Confirmed on
+		 * the phone — `--awb` and the fixed table produced byte-for-
+		 * byte comparable frames (R/G 1.35 vs 1.36). */
+		else if (!strcmp(a, "--awb")) { do_awb = true; manual_wb = false; }
+		else if (!strcmp(a, "--no-awb")) { do_awb = false; manual_wb = true; }
 		else if (!strcmp(a, "--ccm")) do_ccm = true;
 		else if (!strcmp(a, "--autofocus")) do_autofocus = true;
 		else if (!strcmp(a, "--warm-bias") && i+1 < argc) warm_bias = atof(argv[++i]);
@@ -853,8 +863,27 @@ int main(int argc, char **argv)
 		if (setup_rc != 0)
 			fprintf(stderr, "cam-snap: fp3-cam-setup returned %d (continuing)\n",
 				setup_rc);
-		load_cam_conf(camera_preset, &dev, &subdev, &lens,
+		load_cam_conf(camera_preset, &dev, &subdev, &lens, &sensor,
 			      &width, &height, &bp, &bayer_explicit);
+
+		/* White balance belongs to the sensor, not the slot. Both modules
+		 * are user-replaceable and the FP3+ kit fits different silicon in
+		 * each, so a phone can carry any mix — and the gains below are
+		 * indexed by slot while having been calibrated against exactly one
+		 * part, the FP3+ rear S5KGM1SP. Measured in one scene with those
+		 * gains: FP3 rear R/G 0.75 (blue), FP3 front R/G 1.19 B/G 1.57
+		 * (magenta), FP3+ front B/G 1.38 (blue); only the S5KGM1SP came
+		 * out neutral.
+		 *
+		 * Deriving per-part gains by scaling those numbers was tried and
+		 * is wrong: it bakes one scene's illuminant into a constant, and
+		 * under different light the same FP3 rear then read R/G 1.36 —
+		 * off by as much in the other direction. Proper per-part
+		 * calibration needs a known target under known illuminants, so
+		 * the sensor is only reported here for now. --awb is the honest
+		 * scene-adaptive option and is now actually reachable. */
+		if (sensor)
+			fprintf(stderr, "cam-snap: sensor %s\n", sensor);
 
 		if (!strcmp(camera_preset, "rear")) {
 			if (!dev)    dev    = "/dev/video0";
@@ -1108,9 +1137,21 @@ int main(int argc, char **argv)
 	if (manual_wb) {
 		gr = wb[0]; gg = wb[1]; gb = wb[2];
 	} else if (do_awb) {
-		/* Gray-world from frame statistics, with a softer 3.0 cap. */
-		gr = (mr > 4) ? (float)(mg / mr) : 1.0f;
-		gb = (mb > 4) ? (float)(mg / mb) : 1.0f;
+		/* Gray-world from frame statistics, with a softer 3.0 cap.
+		 *
+		 * The means arrive straight off the sensor, pedestal and all,
+		 * but the gains are applied after apply_bls_and_gain() has
+		 * taken BLACK_LEVEL off. Ratios of un-subtracted values are
+		 * pulled toward 1 by the shared offset, so AWB under-corrected
+		 * every time: one measured frame read R=113.6 G=146.0 B=114.1,
+		 * giving G/R 1.29, where the same frame after subtraction
+		 * gives 1.65. Compare like with like. */
+		double br = mr - BLACK_LEVEL, bg = mg - BLACK_LEVEL, bb = mb - BLACK_LEVEL;
+		if (br < 1) br = 1;
+		if (bg < 1) bg = 1;
+		if (bb < 1) bb = 1;
+		gr = (mr > BLACK_LEVEL + 4) ? (float)(bg / br) : 1.0f;
+		gb = (mb > BLACK_LEVEL + 4) ? (float)(bg / bb) : 1.0f;
 		/* Warm bias on R: indoor LEDs/fluorescents push the scene
 		 * slightly green; pure gray-world balances to that lighting
 		 * (so it makes the image look as green as the room actually
