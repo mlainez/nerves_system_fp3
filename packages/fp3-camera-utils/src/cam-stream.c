@@ -80,8 +80,47 @@ static uint32_t g_cap_fourcc = V4L2_PIX_FMT_SGRBG10P;
 
 static int g_out_w = OUT_W, g_out_h = OUT_H;
 
-/* Sensor-to-socket age of the most recent encoded frame, milliseconds. */
+/* Sensor-to-socket age of the most recent encoded frame, milliseconds.
+ *
+ * Measured with our own FIFO of submit times rather than the buffer
+ * timestamp we hand Venus: it does not reliably copy OUTPUT timestamps
+ * onto CAPTURE, and reading them back gave 364178 ms — the process
+ * uptime, i.e. a timestamp of zero. Baseline H.264 has no frame
+ * reordering, so encoded frames come out in submission order and a
+ * plain ring buffer is exact. */
 static double g_last_latency_ms = -1.0;
+
+#define LAT_RING 64
+static uint64_t lat_ring[LAT_RING];
+static unsigned lat_head, lat_tail;
+static pthread_mutex_t lat_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void lat_push(uint64_t us)
+{
+	pthread_mutex_lock(&lat_mu);
+	if ((lat_head - lat_tail) < LAT_RING)
+		lat_ring[lat_head++ % LAT_RING] = us;
+	pthread_mutex_unlock(&lat_mu);
+}
+
+static void lat_pop(void)
+{
+	uint64_t submitted = 0;
+	pthread_mutex_lock(&lat_mu);
+	if (lat_head != lat_tail)
+		submitted = lat_ring[lat_tail++ % LAT_RING];
+	pthread_mutex_unlock(&lat_mu);
+	if (!submitted)
+		return;
+	struct timespec n;
+	clock_gettime(CLOCK_MONOTONIC, &n);
+	uint64_t now_us = (uint64_t)n.tv_sec * 1000000ULL + (uint64_t)n.tv_nsec / 1000ULL;
+	g_last_latency_ms = (double)(now_us - submitted) / 1000.0;
+}
+
+/* Frames dropped by the pacer, reported so an over-running sensor is
+ * visible rather than silently costing latency. */
+static unsigned long paced_out;
 
 /* The encoder node find_h264_encoder() settled on. Kept so the startup
  * banner can report what is actually in use: it used to print a
@@ -918,19 +957,7 @@ static void *drain_thread(void *arg)
 			.m.planes = &pl,
 		};
 		while (xioctl(c->enc_fd, VIDIOC_DQBUF, &b) == 0) {
-			/* Age of this frame: the encoder copies the OUTPUT
-			 * buffer's timestamp onto its CAPTURE buffer, and we
-			 * stamp OUTPUT with CLOCK_MONOTONIC at capture. So
-			 * this is exactly how long the frame spent inside us,
-			 * sensor to socket, with nothing attributable to the
-			 * player. Reported in the heartbeat. */
-			if (b.timestamp.tv_sec || b.timestamp.tv_usec) {
-				struct timespec nowts;
-				clock_gettime(CLOCK_MONOTONIC, &nowts);
-				double age = (nowts.tv_sec - b.timestamp.tv_sec) * 1000.0 +
-					     (nowts.tv_nsec / 1000 - b.timestamp.tv_usec) / 1000.0;
-				g_last_latency_ms = age;
-			}
+			lat_pop();
 			size_t n = pl.bytesused;
 			if (n > 0) {
 				const uint8_t *p = c->enc_cap_bufs[b.index].p;
@@ -1472,7 +1499,7 @@ int main(int argc, char **argv)
 	 * When our bayer→NV12 sustains slower than target, no pacing happens
 	 * and we just process every frame. */
 	uint64_t target_interval_us = 1000000ULL / (uint64_t)target_fps;
-	uint64_t last_submit_us = 0;
+	uint64_t next_due_us = 0;
 
 	/* Wall-clock origin for Venus timestamps. Using real elapsed time
 	 * rather than `frame_count / target_fps` keeps the stream's playback
@@ -1566,10 +1593,49 @@ int main(int argc, char **argv)
 				continue;
 			}
 
-			/* Pacer disabled — let throughput run as fast as the
-			 * encoder + sensor allow. target_fps still feeds the
-			 * Venus rate controller via VIDIOC_S_PARM. */
-			(void)target_interval_us; (void)last_submit_us;
+			/* Pace to target_fps. Leaving this off let the pipeline
+			 * run at whatever the sensor and encoder managed —
+			 * measured at 43-45 fps against a stream the player
+			 * treats as 30. The player renders 30 and we push 44,
+			 * so it falls a third of a second behind every second
+			 * and the lag grows without bound: 2-3 seconds within
+			 * a few seconds of watching, which is exactly what was
+			 * reported. Dropping the surplus at the sensor also
+			 * stops us spending bitrate on frames nobody sees. */
+			{
+				struct timespec pts;
+				clock_gettime(CLOCK_MONOTONIC, &pts);
+				uint64_t now_us = (uint64_t)pts.tv_sec * 1000000ULL +
+						  (uint64_t)pts.tv_nsec / 1000ULL;
+
+				/* Pace against a fixed cadence, not against the
+				 * last submission. Measuring "time since last
+				 * submit" rejects any frame that arrives even
+				 * marginally early, and because the sensor's
+				 * jitter is comparable to the interval that
+				 * rejection compounds: measured 24.5 fps out of
+				 * a 30 fps sensor, with 880 frames discarded
+				 * against 330 kept. A deadline that advances by
+				 * exactly one interval keeps the long-run rate
+				 * correct and only sheds genuine surplus.
+				 *
+				 * If we fall behind — the encoder stalls, say —
+				 * the deadline is pulled up to now rather than
+				 * letting a backlog of "owed" frames burst
+				 * through and undo the pacing. */
+				if (!next_due_us)
+					next_due_us = now_us;
+
+				if (now_us + 1000 < next_due_us) {
+					xioctl(cap_fd, VIDIOC_QBUF, &cb);
+					paced_out++;
+					continue;
+				}
+
+				next_due_us += target_interval_us;
+				if (next_due_us < now_us)
+					next_due_us = now_us;
+			}
 
 			/* Pull any live tuning updates before this frame. */
 			pthread_mutex_lock(&ctrl.mu);
@@ -1614,6 +1680,7 @@ int main(int argc, char **argv)
 					 stream_start_us;
 			ob.timestamp.tv_sec  = (long)(ts_us / 1000000ULL);
 			ob.timestamp.tv_usec = (long)(ts_us % 1000000ULL);
+			lat_push(ts_us + stream_start_us);
 			if (xioctl(enc_fd, VIDIOC_QBUF, &ob) < 0) {
 				fprintf(stderr, "enc OUT QBUF: %s\n", strerror(errno));
 			} else {
@@ -1629,10 +1696,10 @@ int main(int argc, char **argv)
 			if (frame_count % 30 == 0) {
 				double elapsed = now_s() - t0;
 				fprintf(stderr,
-					"\rframes=%d  fps=%.1f  out=%llu KB  lat=%.0f ms  ",
+					"\rframes=%d  fps=%.1f  out=%llu KB  lat=%.0f ms  paced=%lu  ",
 					frame_count, frame_count / elapsed,
 					(unsigned long long)(out_total / 1024),
-					g_last_latency_ms);
+					g_last_latency_ms, paced_out);
 			}
 		}
 	}
