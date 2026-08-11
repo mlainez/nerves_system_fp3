@@ -30,6 +30,7 @@
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -883,6 +884,12 @@ int main(int argc, char **argv)
 	if (width % 4 != 0) die("width must be a multiple of 4");
 
 	signal(SIGPIPE, SIG_IGN);
+
+	/* Die with the caller. cam-snap holds the CAMSS pipeline while it
+	 * runs, so one stranded instance blocks every later capture on that
+	 * camera; fp3_camera drives it from an Erlang Port, which can go away
+	 * without reaping us. */
+	prctl(PR_SET_PDEATHSIG, SIGTERM);
 	build_gamma_lut(gamma_val, contrast);
 	if (lsc_amount < 0)
 		lsc_amount = (lens != NULL) ? 0.4f : 0.0f;

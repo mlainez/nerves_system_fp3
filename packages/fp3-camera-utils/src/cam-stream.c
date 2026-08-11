@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/prctl.h>
 #include <arpa/inet.h>
 #include <linux/videodev2.h>
 #include <math.h>
@@ -98,6 +99,17 @@ struct buf {
 };
 
 static volatile int running = 1;
+/* SIGTERM lands here too, not just SIGINT. It used to be unhandled, so
+ * the default action killed us outright and the VIDIOC_STREAMOFF block at
+ * the end of main() never ran — leaving Venus streaming into buffers that
+ * had gone away. The next run then hit `wait for cpu and video core idle
+ * fail (-110)`, which wedges CAMSS along with the encoder and takes stills
+ * down with it until a reboot. That failure was blamed on the encoder for
+ * a long time; it was really our own exit path.
+ *
+ * Because a handler is installed, SIGTERM no longer terminates us for
+ * free: every blocking call it interrupts must check `running` and unwind,
+ * or `kill -TERM` becomes a no-op and we leak the process and its port. */
 static void on_sigint(int s) { (void)s; running = 0; }
 
 /* ----------------------------------------------------------------------
@@ -1205,7 +1217,17 @@ int main(int argc, char **argv)
 	}
 
 	signal(SIGINT, on_sigint);
+	signal(SIGTERM, on_sigint);
+	signal(SIGHUP, on_sigint);
 	signal(SIGPIPE, SIG_IGN);
+
+	/* Die with whoever started us. fp3_camera drives this binary from an
+	 * Erlang Port; if the VM goes down between spawn and Port.close, the
+	 * child survives and keeps its TCP port bound. One such orphan was
+	 * caught holding :8888 for six minutes, refusing every later bind and
+	 * quietly serving a client that had connected to it by mistake. */
+	prctl(PR_SET_PDEATHSIG, SIGTERM);
+	if (getppid() == 1) running = 0;
 
 	/* TCP server: open one client socket, then stream H.264 to it.
 	 * If --listen wasn't passed, we use stdout (the original mode). */
@@ -1229,7 +1251,17 @@ int main(int argc, char **argv)
 		struct sockaddr_in c_addr;
 		socklen_t c_len = sizeof(c_addr);
 		sink_fd = accept(srv_fd, (struct sockaddr *)&c_addr, &c_len);
-		if (sink_fd < 0) die("accept: %s", strerror(errno));
+		if (sink_fd < 0) {
+			/* Interrupted by SIGTERM while waiting for a client:
+			 * exit quietly and give the port back. die() here
+			 * would make a normal stop look like a failure. */
+			if (errno == EINTR || !running) {
+				close(srv_fd);
+				fprintf(stderr, "cam-stream: stopped while waiting for a client\n");
+				return 0;
+			}
+			die("accept: %s", strerror(errno));
+		}
 		fprintf(stderr, "cam-stream: client connected from %s:%d\n",
 			inet_ntoa(c_addr.sin_addr), ntohs(c_addr.sin_port));
 		int nodelay = 1;
