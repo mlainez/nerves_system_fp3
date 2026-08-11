@@ -3,9 +3,9 @@
  * cam-stream: real-time H.264 video from FP3+ rear or front camera.
  *
  * Pipeline:
- *   V4L2 bayer capture (/dev/video0|1, pgAA 10-bit packed)
+ *   V4L2 bayer capture (node resolved via fp3-cam-setup)
  *     → bayer → NV12 (1920x1080, integer 2x downscale + center crop + WB)
- *     → Venus H.264 m2m encoder (/dev/video7)
+ *     → Venus H.264 m2m encoder (node found by capability)
  *     → raw H.264 bytestream to stdout
  *
  * Consume on dev host:
@@ -169,13 +169,111 @@ static int cap_open_and_setup(const char *dev, const char *subdev,
  * V4L2 m2m encoder (Venus)
  * --------------------------------------------------------------------*/
 
+/*
+ * Take the capture node, its subdev and the binned geometry from
+ * /run/fp3-cam-<cam>.conf, which fp3-cam-setup writes after resolving
+ * the media graph. Nothing here may be hardcoded: the modules are
+ * user-replaceable, so the sensor and its geometry differ per phone,
+ * and /dev/videoN and /dev/v4l-subdevN are renumbered per boot.
+ */
+static void load_cam_conf(const char *cam, const char **dev, const char **subdev,
+			  int *w, int *h)
+{
+	static char devbuf[64], subbuf[64];
+	char path[64];
+	snprintf(path, sizeof(path), "/run/fp3-cam-%s.conf", cam);
+
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		fprintf(stderr, "cam-stream: %s missing, using defaults\n", path);
+		return;
+	}
+
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		char *eq = strchr(line, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		char *k = line, *v = eq + 1;
+		v[strcspn(v, "\r\n")] = '\0';
+		if (!strcmp(k, "VIDEO") && *v) {
+			snprintf(devbuf, sizeof(devbuf), "%s", v);
+			*dev = devbuf;
+		} else if (!strcmp(k, "SUBDEV") && *v) {
+			snprintf(subbuf, sizeof(subbuf), "%s", v);
+			*subdev = subbuf;
+		} else if (!strcmp(k, "WIDTH") && *v) {
+			*w = atoi(v);
+		} else if (!strcmp(k, "HEIGHT") && *v) {
+			*h = atoi(v);
+		}
+	}
+	fclose(f);
+	fprintf(stderr, "cam-stream: %s -> %s (%s) %dx%d\n", cam, *dev, *subdev, *w, *h);
+}
+
+/*
+ * Locate the Venus H.264 m2m encoder.
+ *
+ * This used to be hardcoded to /dev/video7. It is not stable: CAMSS and
+ * Venus register their video nodes in whatever order they probe, so the
+ * encoder moves between boots and between the two phones — the same
+ * reason fp3-cam-setup resolves the capture node from the media graph
+ * rather than assuming it. Opening the wrong node here fails obscurely,
+ * as "enc OUTPUT S_FMT: Invalid argument", because a CAMSS capture node
+ * quite reasonably rejects an encoder's format.
+ *
+ * Probe by capability instead: an m2m device that accepts H.264 on its
+ * CAPTURE queue is the encoder, whatever number it was given.
+ */
+static const char *find_h264_encoder(char *buf, size_t buflen)
+{
+	for (int i = 0; i < 64; i++) {
+		snprintf(buf, buflen, "/dev/video%d", i);
+		int fd = open(buf, O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+
+		struct v4l2_capability cap = {0};
+		if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+			close(fd);
+			continue;
+		}
+		if (!(cap.capabilities & (V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M))) {
+			close(fd);
+			continue;
+		}
+
+		/* Does its CAPTURE queue produce H.264? */
+		int found = 0;
+		for (int j = 0; j < 32 && !found; j++) {
+			struct v4l2_fmtdesc fd_ = {0};
+			fd_.index = j;
+			fd_.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+			if (ioctl(fd, VIDIOC_ENUM_FMT, &fd_) < 0)
+				break;
+			if (fd_.pixelformat == V4L2_PIX_FMT_H264)
+				found = 1;
+		}
+		close(fd);
+		if (found)
+			return buf;
+	}
+	return NULL;
+}
+
 static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 		     struct buf caps[ENC_CAP_BUFS],
 		     int bitrate, int target_fps)
 {
-	const char *dev = "/dev/video7";
+	char devbuf[32];
+	const char *dev = find_h264_encoder(devbuf, sizeof(devbuf));
+	if (!dev)
+		die("no V4L2 H.264 m2m encoder found");
 	int fd = open(dev, O_RDWR | O_NONBLOCK);
 	if (fd < 0) die("open %s: %s", dev, strerror(errno));
+	fprintf(stderr, "cam-stream: encoder %s\n", dev);
 
 	/* OUTPUT (input frames): NV12 1920x1080 */
 	struct v4l2_format fmt = {0};
@@ -897,6 +995,7 @@ static int do_autofocus_priv(int cap_fd, struct buf cap_bufs[],
 int main(int argc, char **argv)
 {
 	/* Per-camera config; default is front. --camera rear flips to rear. */
+	const char *cam_name   = "front";
 	const char *cam_dev    = "/dev/video1";
 	const char *cam_subdev = "/dev/v4l-subdev18";
 	int cam_w   = FRONT_BAYER_W_BINNED;
@@ -933,6 +1032,7 @@ int main(int argc, char **argv)
 		if (!strcmp(a, "--camera") && i+1 < argc) {
 			const char *c = argv[++i];
 			if (!strcmp(c, "rear")) {
+				cam_name   = "rear";
 				cam_dev    = "/dev/video0";
 				cam_subdev = "/dev/v4l-subdev16";
 				cam_w  = REAR_BAYER_W_BINNED;
@@ -957,6 +1057,7 @@ int main(int argc, char **argv)
 				/* Rear sustains ~30 fps natively */
 				target_fps = 30;
 			} else if (!strcmp(c, "front")) {
+				cam_name   = "front";
 				/* Front sensor actually delivers ~27 fps in
 				 * practice. We declare 30 to Venus so the
 				 * H.264 stream's framerate matches what mpv
@@ -996,8 +1097,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
 			fprintf(stderr,
 				"usage: cam-stream [--camera front|rear] [--exposure N] [--gain N]\n"
-				"                  [--bitrate bps]   [--frames N]\n"
-				"Streams H.264 NAL units to stdout. Pipe to ffplay/vlc.\n");
+				"                  [--bitrate bps]   [--frames N] [--listen PORT]\n"
+				"                  [--out-nv12]\n"
+				"Without --listen, writes H.264 to stdout; pipe it to ffplay/vlc.\n"
+				"With --listen PORT, serves the H.264 stream to one TCP client:\n"
+				"    ffplay tcp://<phone>:PORT      (or: mpv tcp://<phone>:PORT)\n"
+				"This is a raw H.264 stream over TCP, not HTTP -- a browser\n"
+				"cannot open it.\n");
 			return 0;
 		}
 	}
@@ -1038,7 +1144,7 @@ int main(int argc, char **argv)
 	 * expects, regardless of what cam-snap or the Elixir manager
 	 * left the subdevs set to. */
 	{
-		const char *which = (strcmp(cam_dev, "/dev/video0") == 0) ? "rear" : "front";
+		const char *which = cam_name;
 		char setup_cmd[128];
 		/* Redirect setup output to stderr so it doesn't pollute the
 		 * NV12/H.264 stream on stdout in --out-nv12 mode. */
@@ -1047,6 +1153,9 @@ int main(int argc, char **argv)
 		int rc = system(setup_cmd);
 		if (rc != 0)
 			fprintf(stderr, "cam-stream: fp3-cam-setup returned %d (continuing)\n", rc);
+
+		/* Adopt whatever it resolved, rather than the defaults above. */
+		load_cam_conf(cam_name, &cam_dev, &cam_subdev, &cam_w, &cam_h);
 	}
 
 	signal(SIGINT, on_sigint);
