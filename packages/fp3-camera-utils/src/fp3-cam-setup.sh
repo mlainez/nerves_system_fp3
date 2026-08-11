@@ -3,8 +3,10 @@
 # Idempotent — safe to re-run. media-ctl prints "Unable to parse link"
 # if a link is already enabled; ignore those.
 #
-# Rear:  <rear sensor>  → csiphy0 → csid0 → ispif0 → vfe0_rdi0 → /dev/video0
-# Front: <front sensor> → csiphy2 → csid1 → ispif1 → vfe0_rdi1 → /dev/video1
+# Rear:  <rear sensor>  → csiphy0 → csid0 → ispif0 → vfe0_rdi0 → msm_vfe0_video0
+# Front: <front sensor> → csiphy2 → csid1 → ispif1 → vfe0_rdi1 → msm_vfe0_video1
+#
+# The /dev/videoN and /dev/v4l-subdevN numbers are looked up, never assumed.
 #
 # The camera modules are user-replaceable and the Fairphone 3 and 3+ fit
 # different silicon in the same slots, so neither the subdev entity name
@@ -54,10 +56,14 @@ sensor_profile() {
 	return 0
 }
 
-# /dev/v4l-subdevN backing an entity. The numbering is not stable — it
-# depends on how many subdevs registered, and the FP3 has two more than
-# the FP3+ because its rear module declares flash LEDs — so it has to be
-# read back rather than assumed.
+# The /dev node backing a media entity, subdev or video. Neither
+# numbering is stable. Subdevs shift because the FP3 registers two more
+# than the FP3+ (its rear module declares flash LEDs), and the CAMSS
+# video nodes shift because they register alongside Venus —
+# msm_vfe0_video0 has been observed as both /dev/video0 and /dev/video1.
+# Opening the wrong video node is not a small mistake: the pipeline gets
+# configured on one RDI lane while frames are read from another, and
+# VIDIOC_STREAMON fails with a silent -EPIPE.
 entity_devnode() {
 	media-ctl -d "$MEDIA" -p 2>/dev/null |
 		awk -v pat="$1" '
@@ -81,10 +87,16 @@ setup_cam() {
 
 	if [ "$which" = rear ]; then
 		addr=3-0010; phy=msm_csiphy0; csid=msm_csid0
-		ispif=msm_ispif0; rdi=msm_vfe0_rdi0; video=/dev/video0
+		ispif=msm_ispif0; rdi=msm_vfe0_rdi0; vnode=msm_vfe0_video0
 	else
 		addr=4-0010; phy=msm_csiphy2; csid=msm_csid1
-		ispif=msm_ispif1; rdi=msm_vfe0_rdi1; video=/dev/video1
+		ispif=msm_ispif1; rdi=msm_vfe0_rdi1; vnode=msm_vfe0_video1
+	fi
+
+	video=$(entity_devnode "${vnode} ")
+	if [ -z "$video" ]; then
+		echo "fp3-cam-setup: no video node for ${vnode}" >&2
+		return 1
 	fi
 
 	entity=$(sensor_entity "$addr")

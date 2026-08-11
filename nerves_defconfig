@@ -42,7 +42,7 @@ BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/mlainez/linux-msm8953"
 # stale prebuilt artifact be reused silently. This file and
 # linux-6.19.defconfig are both in that list, so changing either one
 # does produce a new checksum.
-BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="6084f591155d49eb3cf242caaf1725f5bc44da9d"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="5a9b71bb65fd621e6c713ad0fd57b36568db0ad5"
 BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
 BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="${NERVES_DEFCONFIG_DIR}/linux-6.19.defconfig"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
