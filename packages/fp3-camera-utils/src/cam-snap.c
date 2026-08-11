@@ -670,6 +670,7 @@ static const char *USAGE =
 	"               [--frames 1..9]              multi-frame averaging\n"
 	"               [--exposure N] [--gain N]\n"
 	"               [--bayer grbg|rggb|bggr|gbrg]   (default grbg)\n"
+	"               [--binned]                      (2x2 binned capture: 1/4 the pixels, 4x the light)\n"
 	"               [--awb]                         (gray-world AWB, the default)\n"
 	"               [--no-awb]                      (use the built-in per-slot gains instead)\n"
 	"               [--wb R G B]                    (manual gains; overrides --awb)\n"
@@ -787,6 +788,12 @@ int main(int argc, char **argv)
 	bool use_phone_curve = false;  /* histogram-matched Android-look LUTs */
 	const char *camera_preset = NULL;
 	const char *sensor = NULL;   /* the fitted part, from /run/fp3-cam-*.conf */
+	/* Capture from the sensor's 2x2-binned mode instead of full
+	 * resolution: a quarter of the pixels, four times the light per
+	 * pixel, and a quarter of the MIPI data rate. Geometry comes from
+	 * the conf that fp3-cam-setup publishes, so nothing here needs to
+	 * know the sizes. */
+	bool binned = false;
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -813,6 +820,7 @@ int main(int argc, char **argv)
 		 * to set do_awb and then be ignored entirely. Confirmed on
 		 * the phone — `--awb` and the fixed table produced byte-for-
 		 * byte comparable frames (R/G 1.35 vs 1.36). */
+		else if (!strcmp(a, "--binned")) binned = true;
 		else if (!strcmp(a, "--awb")) { do_awb = true; manual_wb = false; }
 		else if (!strcmp(a, "--no-awb")) { do_awb = false; manual_wb = true; }
 		else if (!strcmp(a, "--ccm")) do_ccm = true;
@@ -856,9 +864,17 @@ int main(int argc, char **argv)
 		 * none of this can be a constant: the rear slot is a 4032x3024
 		 * RGGB IMX363 on one phone and a 4000x3000 GRBG S5KGM1SP on the
 		 * other, and even /dev/v4l-subdevN shifts between them. */
-		char setup_cmd[128];
+		/* cam-snap configures the pipeline itself, so configuring it
+		 * beforehand is pointless — this call overwrites it. That is
+		 * why `fp3-cam-setup --binned front` followed by cam-snap
+		 * died on -EPIPE: the pipeline went back to full resolution
+		 * here while the capture still asked for the binned size, and
+		 * CAMSS checks the video node's format against the pipeline
+		 * feeding it. --binned has to be threaded through. */
+		char setup_cmd[160];
 		snprintf(setup_cmd, sizeof(setup_cmd),
-			 "/usr/bin/fp3-cam-setup %s 1>&2", camera_preset);
+			 "/usr/bin/fp3-cam-setup %s%s 1>&2",
+			 binned ? "--binned " : "", camera_preset);
 		int setup_rc = system(setup_cmd);
 		if (setup_rc != 0)
 			fprintf(stderr, "cam-snap: fp3-cam-setup returned %d (continuing)\n",
