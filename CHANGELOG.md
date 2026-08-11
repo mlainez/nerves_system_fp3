@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.1.4
+
+Fixes the Venus wedge that could kill video encode and decode until
+reboot. Structural, in the driver — v0.1.3 shipped this as a known gap.
+
+### Fixed
+
+- **A stalled video session bricked Venus until reboot.**
+  `venus_suspend_3xx()` polls for the firmware ARM9 to reach WFI and the
+  video core to report idle, then powers off. It never checked whether a
+  session was still loaded with buffers in flight, and on failure
+  returned the poll's `-ETIMEDOUT`.
+
+  Nothing holds a runtime-PM reference for the duration of a streaming
+  session: `venc_start_streaming()` takes one and immediately drops it
+  with an autosuspend put, so a live session stays powered only because
+  each `buf_done` marks the device busy against a 2000 ms autosuspend
+  delay. Any two-second gap in buffer traffic therefore let runtime PM
+  try to collapse a loaded session — and on this HFI 3xx generation
+  `vcodec_control_v3()` gates the vcodec clock and GDSC with no firmware
+  consent at all, unlike the v4 variant. The 1xx path guards against
+  exactly this, sending `HFI_CMD_SYS_PC_PREP`, requiring empty queues
+  and waiting for the firmware's `PC_READY` bit; 3xx had none of it.
+
+  The return value mattered as much as the missing check. The PM core
+  latches anything other than `-EAGAIN`/`-EBUSY` into
+  `dev->power.runtime_error`, after which every resume of the device
+  returns `-EINVAL` — encoder and decoder both dead, with no way back,
+  because `venus_sys_error_handler()` begins with `pm_runtime_get_sync()`
+  on the device that can no longer resume. Only unbind/rebind or a
+  reboot cleared it.
+
+  The 3xx path now checks the queues before polling and reports a busy
+  core as `-EBUSY`, which is accurate and lets runtime PM retry. Kernel
+  `6.19/staging ec152ea73931`.
+
+  No upstream patch, merged or pending, addresses this latch.
+
+- **A slow client could provoke it.** `cam-stream`'s drain thread wrote
+  to the client socket with a blocking `write()` and no send timeout, so
+  a player that stopped draining blocked it indefinitely: every encoder
+  CAPTURE buffer ended up held by firmware, `buf_done` stopped, and two
+  seconds later the core suspended into a non-idle Venus. The sink now
+  has a 300 ms `SO_SNDTIMEO` and a timed-out write abandons that frame
+  and returns the buffer to the encoder. A slow player costs frames,
+  never the session.
+
+- **Signals could not interrupt that write.** Handlers were installed
+  with `signal()`, whose BSD semantics restart interrupted syscalls.
+  That made the `EINTR` handling around `accept()` dead code and left
+  the sink write immune to `SIGTERM`, including the `PR_SET_PDEATHSIG`
+  one. Now `sigaction` without `SA_RESTART`.
+
+### Verified
+
+On a Fairphone 3, an 8 second deliberate client stall — four times the
+autosuspend delay, previously fatal: no venus or camss messages, the
+session survived, the client resumed and read 5.5 MB more, stills still
+captured afterwards, and the core still reported `suspended` when
+genuinely idle, so idle power collapse is unaffected.
+
 ## v0.1.3
 
 Both cameras work on both phones, stills and live H.264, and the

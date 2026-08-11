@@ -223,9 +223,6 @@ prompt there.
   convolution trips an IR3 shader hang, so the workloads that motivated it
   ran faster on the CPU anyway. Re-enable
   `BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL}` if you need it.
-- Venus can wedge mid-stream (`wait for cpu and video core idle fail`).
-  `fp3_camera` detects the stall and restarts the stream, but the
-  underlying fault is not understood.
 - Camera colour is close to Android's but not calibrated against a known
   target; streams centre-crop rather than scale, so they see about 30%
   less vertical field of view than a still from the same camera.
