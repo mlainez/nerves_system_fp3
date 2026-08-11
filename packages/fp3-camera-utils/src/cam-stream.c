@@ -75,6 +75,10 @@ static uint32_t g_cap_fourcc = V4L2_PIX_FMT_SGRBG10P;
 /* Venus NV12 input alignment. bayer_to_nv12() writes tightly packed rows
  * of g_out_w bytes, so the encoder must not pad the width — see the size
  * computation in main() for what padding does to the picture. */
+/* Give up on a write rather than let the client stall the encoder. Must
+ * stay comfortably under Venus's 2000 ms autosuspend delay. */
+#define SINK_WRITE_TIMEOUT_US 300000
+
 #define ENC_ALIGN_W 128
 #define ENC_ALIGN_H 32
 
@@ -121,6 +125,10 @@ static void lat_pop(void)
 /* Frames dropped by the pacer, reported so an over-running sensor is
  * visible rather than silently costing latency. */
 static unsigned long paced_out;
+
+/* Frames abandoned because the client would not drain in time. Reported
+ * so a struggling player is visible rather than silently degrading. */
+static unsigned long sink_stalls;
 
 /* The encoder node find_h264_encoder() settled on. Kept so the startup
  * banner can report what is actually in use: it used to print a
@@ -966,6 +974,20 @@ static void *drain_thread(void *arg)
 					ssize_t w = write(c->sink_fd, p, left);
 					if (w < 0) {
 						if (errno == EINTR) continue;
+						if (errno == EAGAIN || errno == EWOULDBLOCK) {
+							/* SO_SNDTIMEO fired: the client is
+							 * not draining. Abandon the rest of
+							 * this frame and get the buffer back
+							 * to the encoder. Blocking here is
+							 * what starves buf_done and lets
+							 * Venus autosuspend into a non-idle
+							 * core; a slow player must cost
+							 * frames, never the session. The
+							 * stream self-heals at the next
+							 * keyframe. */
+							sink_stalls++;
+							break;
+						}
 						if (errno == EPIPE) {
 							fprintf(stderr, "client disconnected\n");
 							running = 0;
@@ -1316,9 +1338,18 @@ int main(int argc, char **argv)
 			bayer, g_out_w, g_out_h);
 	}
 
-	signal(SIGINT, on_sigint);
-	signal(SIGTERM, on_sigint);
-	signal(SIGHUP, on_sigint);
+	/* sigaction without SA_RESTART, deliberately. signal() gives BSD
+	 * semantics on glibc, so interrupted syscalls restart — which made
+	 * the EINTR handling around accept() dead code and, worse, left the
+	 * drain thread's sink write uninterruptible. A SIGTERM (including
+	 * the PR_SET_PDEATHSIG one) could then not end a process stalled on
+	 * a wedged client, and only SIGKILL would. */
+	struct sigaction sa = { .sa_handler = on_sigint };
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
 	/* Die with whoever started us. fp3_camera drives this binary from an
@@ -1365,6 +1396,23 @@ int main(int argc, char **argv)
 			inet_ntoa(c_addr.sin_addr), ntohs(c_addr.sin_port));
 		int nodelay = 1;
 		setsockopt(sink_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+		/* Never block on the client indefinitely.
+		 *
+		 * Venus keeps *zero* runtime-PM usage count while encoding:
+		 * venc_start_streaming does pm_get then pm_put(autosuspend),
+		 * and the session stays alive only because each buf_done calls
+		 * pm_runtime_mark_last_busy against a 2 s autosuspend delay.
+		 * So if the sink stops draining, every CAPTURE buffer ends up
+		 * held by firmware, buf_done stops, and two seconds later the
+		 * driver tries to power-collapse a core that is not idle:
+		 *
+		 *   qcom-venus: wait for cpu and video core idle fail (-110)
+		 *
+		 * which kills the encoder and takes CAMSS with it. A slow
+		 * player must cost frames, never the session. */
+		struct timeval snd_to = { .tv_sec = 0, .tv_usec = SINK_WRITE_TIMEOUT_US };
+		setsockopt(sink_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
 	}
 
 	struct buf cap_bufs[CAP_BUFS];
@@ -1696,10 +1744,10 @@ int main(int argc, char **argv)
 			if (frame_count % 30 == 0) {
 				double elapsed = now_s() - t0;
 				fprintf(stderr,
-					"\rframes=%d  fps=%.1f  out=%llu KB  lat=%.0f ms  paced=%lu  ",
+					"\rframes=%d  fps=%.1f  out=%llu KB  lat=%.0f ms  paced=%lu  stalls=%lu  ",
 					frame_count, frame_count / elapsed,
 					(unsigned long long)(out_total / 1024),
-					g_last_latency_ms, paced_out);
+					g_last_latency_ms, paced_out, sink_stalls);
 			}
 		}
 	}
