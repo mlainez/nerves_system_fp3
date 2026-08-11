@@ -80,6 +80,15 @@ static uint32_t g_cap_fourcc = V4L2_PIX_FMT_SGRBG10P;
 
 static int g_out_w = OUT_W, g_out_h = OUT_H;
 
+/* Sensor-to-socket age of the most recent encoded frame, milliseconds. */
+static double g_last_latency_ms = -1.0;
+
+/* The encoder node find_h264_encoder() settled on. Kept so the startup
+ * banner can report what is actually in use: it used to print a
+ * hardcoded /dev/video7, which is the *decoder*, and that sent one
+ * debugging session chasing a device mismatch that did not exist. */
+static char g_enc_dev[64] = "?";
+
 /* Sized so two concurrent cam-stream instances (front + rear) don't
  * starve the CAMSS write-master IRQs. With CAP_BUFS=4 the kernel was
  * logging "qcom-camss: Missing ready buf 0 5!" whenever Venus took a
@@ -212,9 +221,10 @@ static int cap_open_and_setup(const char *dev, const char *subdev,
  * and /dev/videoN and /dev/v4l-subdevN are renumbered per boot.
  */
 static void load_cam_conf(const char *cam, const char **dev, const char **subdev,
-			  int *w, int *h, char *bayer, size_t bayerlen)
+			  const char **lens, int *w, int *h,
+			  char *bayer, size_t bayerlen)
 {
-	static char devbuf[64], subbuf[64];
+	static char devbuf[64], subbuf[64], lensbuf[64];
 	char path[64];
 	snprintf(path, sizeof(path), "/run/fp3-cam-%s.conf", cam);
 
@@ -238,6 +248,9 @@ static void load_cam_conf(const char *cam, const char **dev, const char **subdev
 		} else if (!strcmp(k, "SUBDEV") && *v) {
 			snprintf(subbuf, sizeof(subbuf), "%s", v);
 			*subdev = subbuf;
+		} else if (!strcmp(k, "LENS") && *v) {
+			snprintf(lensbuf, sizeof(lensbuf), "%s", v);
+			*lens = lensbuf;
 		} else if (!strcmp(k, "WIDTH") && *v) {
 			*w = atoi(v);
 		} else if (!strcmp(k, "HEIGHT") && *v) {
@@ -310,6 +323,7 @@ static int enc_setup(struct buf outs[ENC_OUT_BUFS],
 		die("no V4L2 H.264 m2m encoder found");
 	int fd = open(dev, O_RDWR | O_NONBLOCK);
 	if (fd < 0) die("open %s: %s", dev, strerror(errno));
+	snprintf(g_enc_dev, sizeof(g_enc_dev), "%s", dev);
 	fprintf(stderr, "cam-stream: encoder %s\n", dev);
 
 	/* OUTPUT (input frames): NV12 1920x1080 */
@@ -904,6 +918,19 @@ static void *drain_thread(void *arg)
 			.m.planes = &pl,
 		};
 		while (xioctl(c->enc_fd, VIDIOC_DQBUF, &b) == 0) {
+			/* Age of this frame: the encoder copies the OUTPUT
+			 * buffer's timestamp onto its CAPTURE buffer, and we
+			 * stamp OUTPUT with CLOCK_MONOTONIC at capture. So
+			 * this is exactly how long the frame spent inside us,
+			 * sensor to socket, with nothing attributable to the
+			 * player. Reported in the heartbeat. */
+			if (b.timestamp.tv_sec || b.timestamp.tv_usec) {
+				struct timespec nowts;
+				clock_gettime(CLOCK_MONOTONIC, &nowts);
+				double age = (nowts.tv_sec - b.timestamp.tv_sec) * 1000.0 +
+					     (nowts.tv_nsec / 1000 - b.timestamp.tv_usec) / 1000.0;
+				g_last_latency_ms = age;
+			}
 			size_t n = pl.bytesused;
 			if (n > 0) {
 				const uint8_t *p = c->enc_cap_bufs[b.index].p;
@@ -1049,6 +1076,9 @@ int main(int argc, char **argv)
 	const char *cam_name   = "front";
 	const char *cam_dev    = "/dev/video1";
 	const char *cam_subdev = "/dev/v4l-subdev18";
+	/* Lens subdev as published by fp3-cam-setup. NULL when the fitted
+	 * module has no VCM, which is both front parts. */
+	const char *conf_lens  = NULL;
 	int cam_w   = FRONT_BAYER_W_BINNED;
 	int cam_h   = FRONT_BAYER_H_BINNED;
 	/* Per-camera defaults; binning sums 4 photodiodes per output pixel,
@@ -1164,7 +1194,11 @@ int main(int argc, char **argv)
 	 * sustained encode load — 4 Mbps reliably triggers RCU stalls on the
 	 * wifi side, 2 Mbps stays stable. Rear has more thermal/timing room. */
 	if (bitrate == 0)
-		bitrate = (strcmp(cam_dev, "/dev/video1") == 0) ? 2000000 : 4000000;
+		/* By role, never by device node. CAMSS registers its video
+		 * nodes alongside Venus, so the numbers move between phones and
+		 * between boots; keying off "/dev/video1" silently gives the
+		 * rear camera the front's bitrate the moment they shift. */
+		bitrate = !strcmp(cam_name, "front") ? 2000000 : 4000000;
 
 	cam_pipeline_build_lut(gamma_lut, 256, gamma_val, contrast, brightness);
 
@@ -1181,8 +1215,12 @@ int main(int argc, char **argv)
 	ctrl.rebuild_lut = 0;
 	if (control_port == 0 && listen_port > 0) control_port = listen_port + 1;
 	cam_subdev_path = cam_subdev;
-	if (strcmp(cam_dev, "/dev/video0") == 0)
-		lens_dev_path = "/dev/v4l-subdev17";  /* DW9800W rear VCM */
+	/* Only the rear module has a VCM, and its subdev number is not
+	 * fixed either — fp3-cam-setup publishes whichever it found.
+	 * Choosing it by device path meant that if the front ever landed
+	 * on video0 we would drive focus on a fixed-focus module. */
+	if (!strcmp(cam_name, "rear") && conf_lens)
+		lens_dev_path = conf_lens;
 	if (control_port > 0) {
 		pthread_t ctrl_th;
 		pthread_create(&ctrl_th, NULL, control_thread, NULL);
@@ -1207,8 +1245,8 @@ int main(int argc, char **argv)
 
 		/* Adopt whatever it resolved, rather than the defaults above. */
 		char bayer[8] = "grbg";
-		load_cam_conf(cam_name, &cam_dev, &cam_subdev, &cam_w, &cam_h,
-			      bayer, sizeof(bayer));
+		load_cam_conf(cam_name, &cam_dev, &cam_subdev, &conf_lens,
+			      &cam_w, &cam_h, bayer, sizeof(bayer));
 
 		/* Bayer order decides both the capture fourcc and the crop
 		 * phase that normalises the sensor to the GRBG demosaic. */
@@ -1262,7 +1300,6 @@ int main(int argc, char **argv)
 	 * caught holding :8888 for six minutes, refusing every later bind and
 	 * quietly serving a client that had connected to it by mistake. */
 	prctl(PR_SET_PDEATHSIG, SIGTERM);
-	if (getppid() == 1) running = 0;
 
 	/* TCP server: open one client socket, then stream H.264 to it.
 	 * If --listen wasn't passed, we use stdout (the original mode). */
@@ -1319,8 +1356,8 @@ int main(int argc, char **argv)
 	 *   - neither flag    → DAC = 0 (infinity), good default for normal
 	 *                       indoor / outdoor framing
 	 * Front cam has no VCM so the path is skipped. */
-	const char *lens_dev = "/dev/v4l-subdev17";
-	if (strcmp(cam_dev, "/dev/video0") == 0) {
+	const char *lens_dev = conf_lens;
+	if (!strcmp(cam_name, "rear") && lens_dev) {
 		if (do_autofocus) {
 			fprintf(stderr, "cam-stream: one-shot AF sweep…\n");
 			do_autofocus_priv(cap_fd, cap_bufs, cam_w, cam_h, lens_dev);
@@ -1404,8 +1441,8 @@ int main(int argc, char **argv)
 	}
 
 	fprintf(stderr,
-		"cam-stream: cap=%s %dx%d → enc=/dev/video7 %dx%d H.264 %dbps\n",
-		cam_dev, cam_w, cam_h, g_out_w, g_out_h, bitrate);
+		"cam-stream: cap=%s %dx%d → enc=%s %dx%d H.264 %dbps\n",
+		cam_dev, cam_w, cam_h, g_enc_dev, g_out_w, g_out_h, bitrate);
 
 	/* All enc OUTPUT buffers are free initially. We track that with a
 	 * simple free-list: enc_out_free[i] = 1 means buffer i is available
@@ -1592,9 +1629,10 @@ int main(int argc, char **argv)
 			if (frame_count % 30 == 0) {
 				double elapsed = now_s() - t0;
 				fprintf(stderr,
-					"\rframes=%d  fps=%.1f  out=%llu KB  ",
+					"\rframes=%d  fps=%.1f  out=%llu KB  lat=%.0f ms  ",
 					frame_count, frame_count / elapsed,
-					(unsigned long long)(out_total / 1024));
+					(unsigned long long)(out_total / 1024),
+					g_last_latency_ms);
 			}
 		}
 	}
