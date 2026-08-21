@@ -1,0 +1,26 @@
+Create the Nerves rootdisk symlink for nested userdata firmware
+
+The FP3 root filesystem is a device-mapper subpartition inside the Android
+userdata partition. erlinit cannot infer the parent firmware device from that
+device-mapper node, so it does not create /dev/rootdisk0 itself. Create the
+standard Nerves symlink while the initramfs still has the base device path.
+
+This lets nerves_runtime run ops.fw against /dev/mmcblk0p62 instead of an
+absent (or incorrectly inferred) device.
+
+Signed-off-by: Marc <marc@citronics.com>
+
+--- a/initramfs/usr/share/citronics-initramfs/functions.sh
++++ b/initramfs/usr/share/citronics-initramfs/functions.sh
+@@ -373,6 +373,11 @@
+     else
+         echo_kmsg "No subpartition mapping required for $rootfs"
+     fi
++
++    # The rootfs is a device-mapper node, so erlinit cannot infer its parent
++    # firmware device. Publish the conventional Nerves path before switch_root.
++    ln -sf "$base_device" /dev/rootdisk0
++    echo_kmsg "Created /dev/rootdisk0 -> $base_device"
+ }
+ 
+ mount_rootfs() {

@@ -237,6 +237,12 @@ BR2_PACKAGE_MESA3D_OPENGL=y
 BR2_PACKAGE_MESA3D_OPENGL_ES=y
 BR2_PACKAGE_MESA3D_OPENGL_EGL=y
 BR2_PACKAGE_MESA3D_GBM=y
+# Emerge's rust-skia NIF links these directly. Keep them explicit rather
+# than relying on Mesa or another multimedia package to select them.
+BR2_PACKAGE_LIBDRM=y
+BR2_PACKAGE_LIBDRM_FREEDRENO=y
+BR2_PACKAGE_FONTCONFIG=y
+BR2_PACKAGE_FREETYPE=y
 # No OpenCL. Rusticl compiles kernels at runtime, so it drags clang and
 # LLVM onto the device: 177 MB of a 520 MB rootfs, which left the 250 MiB
 # rootfs partition 91% full. The a5xx compute paths in patches/mesa3d are
