@@ -1,0 +1,25 @@
+drm/panel: himax-hx83112b: select DSI video mode
+
+The HX83112B panel is configured for burst-mode video traffic, but its mode
+flags omit MIPI_DSI_MODE_VIDEO. The MSM display stack therefore classifies the
+interface as command mode and selects command-mode completion paths. On the
+Fairphone 3 that causes atomic state swaps to block and presentation to
+phase-lock between 30 and 60 frames per second.
+
+Set the base video-mode flag alongside the burst-mode modifier so the host and
+display backend use the video-mode timing and completion paths.
+
+---
+diff --git a/drivers/gpu/drm/panel/panel-himax-hx83112b.c b/drivers/gpu/drm/panel/panel-himax-hx83112b.c
+index 263f79a967de..a882a1842600 100644
+--- a/drivers/gpu/drm/panel/panel-himax-hx83112b.c
++++ b/drivers/gpu/drm/panel/panel-himax-hx83112b.c
+@@ -376,7 +376,7 @@ static int hx83112b_probe(struct mipi_dsi_device *dsi)
+ 
+ 	dsi->lanes = 4;
+ 	dsi->format = MIPI_DSI_FMT_RGB888;
+-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST |
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
+ 			  MIPI_DSI_CLOCK_NON_CONTINUOUS |
+ 			  MIPI_DSI_MODE_VIDEO_NO_HSA | MIPI_DSI_MODE_LPM;
+ 
