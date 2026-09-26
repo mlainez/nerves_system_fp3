@@ -230,6 +230,12 @@ LEDs are under `/sys/class/leds` (write `brightness`; the RGB LED also
 takes `multi_intensity`). The vibrator is a force-feedback input device;
 `rumble 300` vibrates for 300 ms.
 
+**Screen and touch.** The panel is a DRM device (`msm`) with fbdev
+emulation on `/dev/fb0`; the HX83112B touchscreen and the volume and
+power buttons are input devices. Scenic's `cairo-fb` driver
+(`scenic_driver_local` with `SCENIC_LOCAL_TARGET=cairo-fb`) renders to
+the framebuffer and reads the touchscreen and buttons.
+
 **UART.** `ttyMSM0` exists but needs wires soldered to pads inside the phone.
 Swap the `-c` line in `rootfs_overlay/etc/erlinit.config` to move the IEx
 prompt there.

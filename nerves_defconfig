@@ -240,5 +240,7 @@ BR2_PACKAGE_LIBDRM=y
 BR2_PACKAGE_LIBDRM_FREEDRENO=y
 BR2_PACKAGE_FONTCONFIG=y
 BR2_PACKAGE_FREETYPE=y
+# Cairo: 2D rendering for Scenic's cairo-fb driver (scenic_driver_local).
+BR2_PACKAGE_CAIRO=y
 # No OpenCL: ML compute runs on the CPU through nx_arm. Rusticl would also
 # drag clang and LLVM onto the device (177 MB of a 250 MiB rootfs).

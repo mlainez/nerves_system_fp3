@@ -18,6 +18,8 @@ OpenCL leftovers.
 
 ### Added
 
+- Cairo (with Pixman), so Scenic's `cairo-fb` driver can render to the
+  screen.
 - `rumble`: plays a vibration on the first force-feedback input device
   (the PMI632 vibrator), e.g. `rumble 300`. Driving the vibrator needs an
   ioctl, which Elixir can't issue directly.
