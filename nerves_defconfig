@@ -243,9 +243,5 @@ BR2_PACKAGE_LIBDRM=y
 BR2_PACKAGE_LIBDRM_FREEDRENO=y
 BR2_PACKAGE_FONTCONFIG=y
 BR2_PACKAGE_FREETYPE=y
-# No OpenCL. Rusticl compiles kernels at runtime, so it drags clang and
-# LLVM onto the device: 177 MB of a 520 MB rootfs, which left the 250 MiB
-# rootfs partition 91% full. The a5xx compute paths in patches/mesa3d are
-# kept — GLES 3.1 compute shaders go through the same ir3 code — but the
-# OpenCL front end is not worth a third of the filesystem here. Set
-# BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL} to bring it back.
+# No OpenCL: ML compute runs on the CPU through nx_arm. Rusticl would also
+# drag clang and LLVM onto the device (177 MB of a 250 MiB rootfs).
