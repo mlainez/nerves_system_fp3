@@ -88,17 +88,16 @@ BR2_PACKAGE_PARTED=y
 # its `tools` sub-option installs media-ctl (CAMSS pipeline links + pad
 # formats), v4l2-ctl (introspect / single-frame capture), v4l2-compliance,
 # ir-keytable, etc. yavta is a lightweight V4L2 streaming test tool
-# handy for sanity-checking the pipeline before bringing GStreamer or
-# Membrane on top. Note: buildroot 2025.11 renamed v4l-utils → libv4l.
+# handy for sanity-checking the pipeline. Note: Buildroot 2025.11 renamed
+# v4l-utils → libv4l.
 BR2_PACKAGE_LIBV4L=y
 BR2_PACKAGE_LIBV4L_UTILS=y
 BR2_PACKAGE_YAVTA=y
 
-# GStreamer 1.x — the high-level camera + video pipeline driver. We use it
-# both to capture stills (camera → bayer2rgb → JPEG) and to stream live
-# video (camera → bayer2rgb → NV12 → Venus H.264 via v4l2 M2M → RTSP).
-# The bayer2rgb-neon plugin understands 10-bit packed Bayer (SGRBG10P)
-# straight off the CAMSS RDI lane, so we don't need a software unpack.
+# GStreamer 1.x, for building your own camera/video pipelines from a shell
+# or a Port. The fp3_camera library does not use it: stills and streams go
+# through cam-snap / cam-stream from fp3-camera-utils. The bayer2rgb-neon
+# plugin understands 10-bit packed Bayer (SGRBG10P) off the CAMSS RDI lane.
 BR2_PACKAGE_GSTREAMER1=y
 BR2_PACKAGE_GST1_PLUGINS_BASE=y
 BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_APP=y
@@ -126,22 +125,19 @@ BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_VIDEOPARSERS=y
 BR2_PACKAGE_GST1_PLUGINS_BAYER2RGB_NEON=y
 BR2_PACKAGE_GST1_RTSP_SERVER=y
 
-# ffmpeg — does the heavy lifting for live video on the FP3+:
-# V4L2 bayer capture → demosaic → NV12 → Venus H.264 (h264_v4l2m2m) →
-# MPEG-TS over HTTP (-listen 1 makes ffmpeg itself the HTTP server).
-# VLC opens http://nerves.local:8888/cam and Just Works. The Elixir
-# side spawns ffmpeg per camera via Port and supervises it. v4l2_m2m
-# auto-detects when libv4l is present (already enabled above).
+# ffmpeg, for transcoding or remuxing video on the device (for example
+# wrapping cam-stream's raw H.264 in a container). Not used by fp3_camera.
+# h264_v4l2m2m (Venus) is available because libv4l is enabled above.
 BR2_PACKAGE_FFMPEG=y
 BR2_PACKAGE_FFMPEG_FFMPEG=y
 BR2_PACKAGE_FFMPEG_GPL=y
 BR2_PACKAGE_FFMPEG_SWSCALE=y
 
-# libcamera — handles 3A (AE/AWB/AGC) + black-level / colour matrix /
-# gamma in its SoftwareISP. The msm8953 CAMSS exposes only raw Bayer
-# to userspace; without these algorithms the output looks heavily green
-# and washed-out. The "simple" pipeline handler is the matching one
-# for non-vendor-ISP devices like ours.
+# libcamera with its SoftwareISP (3A, black level, colour matrix, gamma),
+# for experimenting with the `cam` CLI. The msm8953 CAMSS exposes only raw
+# Bayer; fp3_camera does its own processing in cam-snap / cam-stream and
+# does not use libcamera. The "simple" pipeline handler matches devices
+# without a vendor ISP.
 BR2_PACKAGE_LIBCAMERA=y
 BR2_PACKAGE_LIBCAMERA_PIPELINE_SIMPLE=y
 BR2_PACKAGE_LIBCAMERA_V4L2=y
@@ -215,11 +211,11 @@ BR2_PACKAGE_UNUDHCPD=y
 BR2_PACKAGE_QRTR=y
 BR2_PACKAGE_RMTFS=y
 BR2_PACKAGE_TQFTPSERV=y
-BR2_PACKAGE_RUMBLE=y
 BR2_PACKAGE_HEXAGONRPC=y
 BR2_PACKAGE_REBOOT_MODE=y
 BR2_PACKAGE_QBOOTCTL=y
 BR2_PACKAGE_FP3_CAMERA_UTILS=y
+BR2_PACKAGE_RUMBLE=y
 BR2_PACKAGE_JPEG=y
 BR2_PACKAGE_JPEG_TURBO=y
 

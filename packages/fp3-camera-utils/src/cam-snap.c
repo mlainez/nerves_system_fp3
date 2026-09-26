@@ -671,7 +671,7 @@ static const char *USAGE =
 	"               [--exposure N] [--gain N]\n"
 	"               [--bayer grbg|rggb|bggr|gbrg]   (default grbg)\n"
 	"               [--binned]                      (2x2 binned capture: 1/4 the pixels, 4x the light)\n"
-	"               [--awb]                         (gray-world AWB, the default)\n"
+	"               [--awb]                         (gray-world AWB; off by default)\n"
 	"               [--no-awb]                      (use the built-in per-slot gains instead)\n"
 	"               [--wb R G B]                    (manual gains; overrides --awb)\n"
 	"               [--warm-bias 1.05]              (R-gain multiplier; LED+fluo are green-biased)\n"

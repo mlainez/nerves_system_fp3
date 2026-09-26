@@ -1327,9 +1327,10 @@ int main(int argc, char **argv)
 		 * just unwritten black. Which is why this stayed hidden: the
 		 * FP3 rear, and both FP3+ cameras, bin to at least 1920 and
 		 * get capped to 1920 = 15 x 128, already aligned. The FP3
-		 * front bins to 1440, lands on 1424, and Venus pads it to
-		 * 1536. It was the one torn stream, and it looked for all the
-		 * world like a broken sensor. */
+		 * front bins to 1440, which used to land on 1424 and get
+		 * padded by Venus to 1536. It was the one torn stream, and it
+		 * looked for all the world like a broken sensor. Aligning to
+		 * ENC_ALIGN_W below now gives 1408. */
 		int fit_w = (cam_w - 1) & ~(ENC_ALIGN_W - 1);
 		int fit_h = (cam_h - 1) & ~(ENC_ALIGN_H - 1);
 		g_out_w = fit_w < OUT_W ? fit_w : (OUT_W & ~(ENC_ALIGN_W - 1));

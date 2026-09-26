@@ -1,5 +1,5 @@
 config BR2_PACKAGE_FP3_FIRMWARE
-	bool "fp3-firmware [FP3+ only]"
+	bool "fp3-firmware [FP3 only]"
 	help
 	  This package provides all firmware binaries for Fairphone 3,
 	  including DTS firmware-name symlinks and the ADSP sensor

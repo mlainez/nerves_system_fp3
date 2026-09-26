@@ -1,5 +1,5 @@
 config BR2_PACKAGE_FP3_CAMERA_UTILS
-	bool "fp3-camera-utils [FP3+ only]"
+	bool "fp3-camera-utils [FP3 only]"
 	depends on BR2_PACKAGE_BAYER2RGB_NEON_ARCH_SUPPORTS
 	select BR2_PACKAGE_BAYER2RGB_NEON
 	select BR2_PACKAGE_JPEG
@@ -7,9 +7,9 @@ config BR2_PACKAGE_FP3_CAMERA_UTILS
 	  Fairphone 3+ specific camera tooling: stills, live video, raw
 	  capture, and an i2c bus probe used during sensor bring-up.
 
-	  Hardware-bound to the msm8953 CAMSS pipeline and the FP3+'s
+	  Hardware-bound to the msm8953 CAMSS pipeline and the Fairphone 3's
 	  two sensors (rear: Samsung S5KGM1SP / front: Samsung S5K3P9SP).
-	  All four binaries assume the FP3+ media graph and will not be
+	  All four binaries assume the Fairphone 3 media graph and will not be
 	  useful on other boards.
 
 	  Installs four binaries plus a setup helper:
