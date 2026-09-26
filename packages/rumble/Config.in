@@ -1,0 +1,7 @@
+config BR2_PACKAGE_RUMBLE
+	bool "rumble [Generic]"
+	help
+	  Plays one force-feedback rumble effect on the first input device
+	  that supports FF_RUMBLE, such as a phone vibrator:
+
+	    rumble [-d /dev/input/eventN] DURATION_MS [STRENGTH]
