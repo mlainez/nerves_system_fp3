@@ -12,7 +12,7 @@ defmodule NervesSystemFP3.MixProject do
     [
       app: @app,
       version: @version,
-      elixir: "~> 1.20",
+      elixir: "~> 1.17",
       compilers: Mix.compilers() ++ [:nerves_package],
       nerves_package: nerves_package(),
       description: description(),
@@ -23,12 +23,12 @@ defmodule NervesSystemFP3.MixProject do
     ]
   end
 
-  def application do
-    []
-  end
-
   def cli do
     [preferred_envs: %{docs: :docs, "hex.build": :docs, "hex.publish": :docs}]
+  end
+
+  def application do
+    []
   end
 
   defp bootstrap(args) do
@@ -64,9 +64,9 @@ defmodule NervesSystemFP3.MixProject do
 
   defp deps do
     [
-      {:nerves, "~> 1.15", runtime: false},
+      {:nerves, "~> 1.11 or ~> 2.0 or ~> 2.0.0-dev", runtime: false},
       {:nerves_system_br, "1.35.0", runtime: false},
-      {:nerves_toolchain_aarch64_nerves_linux_gnu, "~> 14.2.0", runtime: false},
+      {:nerves_toolchain_aarch64_nerves_linux_gnu, "~> 15.3.0", runtime: false},
       {:nerves_system_linter, "~> 0.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.22", only: :docs, runtime: false}
     ]
