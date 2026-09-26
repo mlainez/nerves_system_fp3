@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
 
 Moves to the current official Nerves platform (with PR #4) and drops the
 OpenCL leftovers.
