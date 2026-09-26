@@ -6,7 +6,7 @@
 
 RMTFS_VERSION = 33e1e40615efc59b17a515afe857c51b8b8c1ad1
 RMTFS_SITE = $(call github,linux-msm,rmtfs,$(RMTFS_VERSION))
-RTMFS_DEPENDENCIES = qrtr libqrtr libudev
+RMTFS_DEPENDENCIES = qrtr libudev
 
 define RMTFS_BUILD_CMDS
     $(TARGET_MAKE_ENV) $(MAKE) -C $(@D) \
