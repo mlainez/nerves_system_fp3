@@ -5,9 +5,9 @@ Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 
 | Feature      | Description                                                 |
 | ------------ | ----------------------------------------------------------- |
-| CPU          | 8× Snapdragon 632 (Cortex-A53, aarch64)                     |
+| CPU          | Snapdragon 632: 4× Kryo 250 Gold + 4× Kryo 250 Silver, aarch64 |
 | GPU          | Adreno 506 — OpenGL ES (Mesa Freedreno)                     |
-| Memory       | 3 GB LPDDR3                                                 |
+| Memory       | 4 GB LPDDR3, 64 GB eMMC                                     |
 | Storage      | eMMC; firmware lives inside the Android `userdata` partition|
 | Linux        | `mlainez/linux-msm8953`, 6.19                               |
 | Bootloader   | lk2nd-msm8953 → `extlinux/extlinux.conf` on the boot partition |
@@ -152,18 +152,28 @@ built that way is not reproducible by anyone else.
 ## Flashing
 
 The stock Fairphone 3 bootloader will not chain-load a foreign kernel, so
-[lk2nd](https://github.com/msm8916-mainline/lk2nd) goes on `boot`
-first and the Nerves firmware into `userdata`:
+[lk2nd](https://github.com/msm8916-mainline/lk2nd) goes on `boot` and the
+Nerves firmware into `userdata`. The stock bootloader also applies the
+device-tree overlays in `dtbo` to whatever it boots, and Android's
+overlays don't match lk2nd, so `dtbo` gets the dummy overlay from
+[z3ntu/dtbo-fp3](https://github.com/z3ntu/dtbo-fp3/releases).
+
+Enable **Developer options → OEM unlocking** in Android first, then:
 
 ```bash
 # Boot into fastboot: hold Volume Down while powering on, USB attached.
 fastboot flashing unlock              # once per device, erases the phone
-fastboot flash boot lk2nd-msm8953.img
+fastboot set_active a
+fastboot flash dtbo dtbo.img          # dummy overlay from z3ntu/dtbo-fp3
+fastboot flash boot lk2nd-msm8953.img # from the lk2nd releases
 fastboot flash userdata fp3_demo.img  # from `mix firmware.image`
 fastboot reboot
 ```
 
-After that, `mix upload` works over the network as usual.
+After that, `mix upload` works over the network as usual. Holding
+Volume Down at power-on now opens lk2nd's fastboot mode (wait until the
+screen turns on before pressing it), from which `userdata` can be
+reflashed.
 
 ## Partition layout
 

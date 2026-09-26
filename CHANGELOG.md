@@ -42,9 +42,11 @@ OpenCL leftovers.
 - `rmtfs.mk` declared `RTMFS_DEPENDENCIES` (typo, and it named a
   nonexistent `libqrtr` package), so Buildroot ignored rmtfs's
   dependencies on qrtr and libudev.
-- README: boot partitions are 100 MiB, `mix nerves.new --target fp3` does
-  not exist, and most Qualcomm kernel support is loadable modules loaded
-  by udevd rather than built in.
+- README: the flashing steps were missing the dummy `dtbo` and slot
+  selection, the phone has 4 GB RAM and a 4+4 core CPU, boot partitions
+  are 100 MiB, `mix nerves.new --target fp3` does not exist, and most
+  Qualcomm kernel support is loadable modules loaded by udevd rather than
+  built in.
 
 ## v0.1.5
 
