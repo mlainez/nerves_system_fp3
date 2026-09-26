@@ -61,7 +61,8 @@ the rest of the phone still boots.
 
 ## Using
 
-In your Nerves application's `mix.exs`:
+In your Nerves application's `mix.exs`, add the system under a target
+name of your choice (here `:fp3`):
 
 ```elixir
 defp deps do
@@ -70,25 +71,23 @@ defp deps do
       github: "mlainez/nerves_system_fp3",
       runtime: false, targets: :fp3, nerves: [compile: true]},
 
-    # Qualcomm bring-up: each of these owns one slice of it.
-    {:ex_rmtfs,       github: "mlainez/ex_rmtfs",       targets: :fp3},
-    {:ex_tqftpserv,   github: "mlainez/ex_tqftpserv",   targets: :fp3},
-    {:ex_hexagonfs,   github: "mlainez/ex_hexagonfs",   targets: :fp3},
-    {:ex_hexagonrpcd, github: "mlainez/ex_hexagonrpcd", targets: :fp3},
-    {:ex_remoteproc,  github: "mlainez/ex_remoteproc",  targets: :fp3},
-
-    # Cellular data.
-    {:vintage_net_qmi, github: "mlainez/vintage_net_qmi", targets: :fp3},
-    {:fp3_modem,       github: "mlainez/fp3_modem",       targets: :fp3}
+    # Qualcomm bring-up libraries, as needed (see the table below).
+    {:ex_rmtfs,      github: "mlainez/ex_rmtfs",      targets: :fp3},
+    {:ex_remoteproc, github: "mlainez/ex_remoteproc", targets: :fp3},
+    {:ex_qbootctl,   github: "mlainez/ex_qbootctl",   targets: :fp3}
   ]
 end
 ```
 
 Then set `MIX_TARGET=fp3`.
+[`nerves_livebook_fp3`](https://github.com/mlainez/nerves_livebook_fp3) is a
+complete firmware built on this system (it uses the target name
+`:nerves_system_fp3`).
 
 The Qualcomm bring-up that a Buildroot port would do from `/etc/init.d/S*` is
-split into small OTP applications instead, each handling one slice and logging
-a warning rather than crashing on unexpected hardware:
+split into small OTP applications instead, each handling one slice. A
+missing device or daemon is logged and retried rather than crashing the
+node. See each library's README for how it starts and what it needs:
 
 | Library | What it needs from this system |
 | --- | --- |
@@ -96,18 +95,20 @@ a warning rather than crashing on unexpected hardware:
 | [`ex_tqftpserv`](https://github.com/mlainez/ex_tqftpserv) | `tqftpserv`; QRTR |
 | [`ex_hexagonfs`](https://github.com/mlainez/ex_hexagonfs) | ACDB/DSP blobs at `/mnt/vendor`, `/mnt/dsp` |
 | [`ex_hexagonrpcd`](https://github.com/mlainez/ex_hexagonrpcd) | `hexagonrpcd`; `/dev/fastrpc-adsp` |
-| [`ex_remoteproc`](https://github.com/mlainez/ex_remoteproc) | `/sys/class/remoteproc`; rmtfs serving first |
+| [`ex_remoteproc`](https://github.com/mlainez/ex_remoteproc) | `/sys/class/remoteproc`; firmware in `/lib/firmware` |
 | [`ex_qcom_smgr`](https://github.com/mlainez/ex_qcom_smgr) | `qcom_smgr`; `/sys/bus/iio/devices` |
 | [`ex_audio`](https://github.com/mlainez/ex_audio) | `amixer`; ADSP up before the card binds |
 | [`ex_nfc`](https://github.com/mlainez/ex_nfc) | `NETLINK_GENERIC` + the kernel `nfc` family |
 | [`ex_location`](https://github.com/mlainez/ex_location) | QRTR; modem MSS running |
-| [`fp3_camera`](https://github.com/mlainez/fp3_camera) | `media-ctl`, `cam-snap`, `cam-stream` |
+| [`fp3_camera`](https://github.com/mlainez/fp3_camera) | `fp3-cam-setup` (`media-ctl`), `cam-snap`, `cam-stream` |
 | [`fp3_modem`](https://github.com/mlainez/fp3_modem) | QRTR + the IPA data path |
 | [`ex_qbootctl`](https://github.com/mlainez/ex_qbootctl) | `/usr/bin/qbootctl` |
-| [`nerves_data_resize`](https://github.com/mlainez/nerves_data_resize) | `resize.f2fs`, `blockdev` |
+| [`nerves_data_resize`](https://github.com/mlainez/nerves_data_resize) | `resize.f2fs`, `df`, `mount`, `umount` |
 
-The QRTR, remoteproc, fastrpc, sns-reg, sysmon and pd-mapper kernel modules
-are all built in — there is nothing to `modprobe`.
+FastRPC and remoteproc are built into the kernel. QRTR, pd-mapper,
+rmtfs-mem and the sensor drivers are loadable modules that udevd loads
+from their modaliases; `ex_rmtfs` starts udevd and triggers the initial
+coldplug, so it has to run on any firmware that uses this hardware.
 
 ## Building
 
@@ -119,8 +120,10 @@ Erlang, Elixir, `fwup`, `squashfs-tools`, `cmake`, `autoconf`, `bc` and
 ```bash
 mix archive.install hex nerves_bootstrap
 
-# A throw-away app to build against.
-mix nerves.new fp3_demo --target fp3
+# A throw-away app to build against. nerves.new only knows the official
+# targets, so generate a default project and add the system dependency
+# shown under "Using" by hand.
+mix nerves.new fp3_demo
 cd fp3_demo
 
 export MIX_TARGET=fp3
@@ -173,8 +176,8 @@ early, exposing `/dev/mmcblk0p62p1` … `p3`.
 /dev/mmcblk0p62   ── flashed with `fastboot flash userdata` ──
 ├─ MBR (block 0)
 ├─ uboot env       (Nerves firmware metadata, 8 KiB)
-├─ Boot A          (ext2, 50 MiB — kernel + dtb + initramfs + extlinux)
-├─ Boot B          (ext2, 50 MiB)
+├─ Boot A          (ext2, 100 MiB — kernel + dtb + initramfs + extlinux)
+├─ Boot B          (ext2, 100 MiB)
 ├─ Rootfs A        (squashfs, 250 MiB)
 ├─ Rootfs B        (squashfs, 250 MiB)
 └─ Application     (f2fs, fills the rest, mounted at /root)
@@ -192,8 +195,10 @@ the read-only Android partitions `p32`, `p34` and `p13` at `/mnt/vendor`,
 ## Notes on specific hardware
 
 **Modem and Wi-Fi.** The kernel auto-boots the ADSP and modem remoteprocs; no
-userspace nudge is needed. `VintageNetQMI.quick_configure("internet")` brings
-up cellular data. Wi-Fi is `wpa_supplicant` + VintageNet.
+userspace nudge is needed. Cellular data goes through the QRTR branch
+of `vintage_net_qmi` plus `Fp3Modem.PowerManager`; see the
+[`fp3_modem`](https://github.com/mlainez/fp3_modem) README for a complete
+VintageNet config. Wi-Fi is `wpa_supplicant` + VintageNet.
 
 **Audio.** `aplay -D plughw:0,0 file.wav`. The amplifier firmware comes from
 the `fp3-firmware` package.
@@ -210,19 +215,21 @@ open them; use `ffplay tcp://…`.
 **Sensors.** The Qualcomm stack runs on the ADSP and surfaces under
 `/sys/bus/iio/devices/`.
 
+**LEDs and vibrator.** The RGB notification LED and the two white flash
+LEDs are under `/sys/class/leds` (write `brightness`; the RGB LED also
+takes `multi_intensity`). The vibrator is a force-feedback input device;
+`rumble 300` vibrates for 300 ms.
+
 **UART.** `ttyMSM0` exists but needs wires soldered to pads inside the phone.
 Swap the `-c` line in `rootfs_overlay/etc/erlinit.config` to move the IEx
 prompt there.
 
 ## Known gaps
 
-- **No OpenCL.** Rusticl compiles kernels at runtime, so it puts clang and
-  LLVM on the device — 177 MB of a 520 MB rootfs, against a 250 MiB rootfs
-  partition. It does work on this GPU (OpenCL 3.0, with the a5xx compute
-  patches in `patches/mesa3d`), but on a5xx `cl_khr_fp16` is rejected and
-  convolution trips an IR3 shader hang, so the workloads that motivated it
-  ran faster on the CPU anyway. Re-enable
-  `BR2_PACKAGE_MESA3D_{LLVM,OPENCL,RUSTICL}` if you need it.
+- **No OpenCL.** ML workloads run on the CPU through
+  [`nx_arm`](https://github.com/mlainez/nx_arm). Rusticl would also put clang
+  and LLVM on the device (177 MB against a 250 MiB rootfs), and on a5xx it
+  rejected `cl_khr_fp16` and hung the shader compiler on convolutions.
 - Camera colour is close to Android's but not calibrated against a known
   target; streams centre-crop rather than scale, so they see about 30%
   less vertical field of view than a still from the same camera.
