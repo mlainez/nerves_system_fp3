@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Update `nerves_system_br` from 1.33.1 to 1.35.0: Buildroot 2026.08,
+  Erlang/OTP 29.1 and Mesa 26.1.8. Select OTP 29 explicitly and update the
+  host tool versions to OTP 29 / Elixir 1.20.
+- Remove the Clang 21 compatibility patch now included in Mesa and rebase
+  the a5xx global-memory patch for zero-fuzz application to Mesa 26.1.8.
+  Adapt it to the single 64-bit address source and `UNREACHABLE` macro.
+  Keep both a5xx compute fixes and the Freedreno OpenGL ES/EGL/GBM stack.
+- Remove the obsolete `BR2_PACKAGE_MESA3D_OPENGL` option; Buildroot now
+  enables OpenGL unconditionally for Mesa. OpenCL and Vulkan remain disabled.
+- Fix BlueZ 5.86's `bt_ad_has_data(NULL, ...)` return value: use `NULL`
+  instead of `false`, which GCC 14 rejects as a pointer return in C23 mode.
+  Verified by compiling the patched source with the Nerves GCC 14.2 ARM64
+  toolchain; the unpatched source reproduces the build error.
+- Require Nerves 1.15 and update `elixir_make` to 0.10.0 for Elixir 1.20
+  compatibility. Move Mix CLI environment preferences to `cli/0`.
+
 ## v0.1.5
 
 Stable display refresh and correct A/B firmware validation.

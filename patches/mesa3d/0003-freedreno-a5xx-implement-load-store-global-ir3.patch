@@ -18,8 +18,7 @@ a6xx+ only (gated `#elif GPU >= 600` in ir3.h INSTR declarations),
 so on a5xx we accept only the constant-offset form.
 
 That's enough for Rusticl's typical NIR output: the lower_64b_global
-pass in ir3_nir_lower_64b.c emits the offset as nir_imm_int(b, off)
-where `off` is a small constant (vec-8/16 split index). Any kernel
+pass in ir3_nir_lower_64b.c emits a zero constant offset. Any kernel
 whose lowering produces a non-constant offset will hit the
 `unreachable` until someone wires up explicit 64-bit address
 arithmetic for a5xx.
@@ -28,10 +27,14 @@ Identified via core-dump backtrace: addr2line on the lr offset
 0x2c62ec inside libRusticlOpenCL.so resolved to
 src/freedreno/ir3/ir3_compiler_nir.c:2798 in emit_intrinsic.
 
+Rebased on Mesa 26.1.8; the a5xx implementation is still missing upstream.
+Use Mesa 26's single 64-bit address source and UNREACHABLE macro, matching
+the current a6xx lowering rather than collecting two 32-bit components.
+
 --- a/src/freedreno/ir3/ir3_a4xx.c
 +++ b/src/freedreno/ir3/ir3_a4xx.c
-@@ -383,6 +383,80 @@ emit_intrinsic_atomic_global(struct ir3_context *ctx, nir_intrinsic_instr *intr)
-    unreachable("Global atomic are unimplemented on A5xx");
+@@ -383,6 +383,78 @@
+    UNREACHABLE("Global atomic are unimplemented on A5xx");
  }
 
 +static void
@@ -43,8 +46,7 @@ src/freedreno/ir3/ir3_compiler_nir.c:2798 in emit_intrinsic.
 +   unsigned dest_components = nir_intrinsic_dest_components(intr);
 +   struct ir3_instruction *addr;
 +
-+   addr = ir3_collect(b, ir3_get_src(ctx, &intr->src[0])[0],
-+                      ir3_get_src(ctx, &intr->src[0])[1]);
++   addr = ir3_collect(b, ir3_get_src(ctx, &intr->src[0])[0]);
 +
 +   /* a5xx has no LDG_A (register-offset variant — that's a6xx+ only,
 +    * gated `#elif GPU >= 600` in ir3.h). The NIR lower_64b_global pass
@@ -55,7 +57,7 @@ src/freedreno/ir3/ir3_compiler_nir.c:2798 in emit_intrinsic.
 +   if (!nir_src_is_const(intr->src[1]) ||
 +       nir_src_as_int(intr->src[1]) >= (1 << 8) ||
 +       nir_src_as_int(intr->src[1]) <= -(1 << 8)) {
-+      unreachable("a5xx load_global_ir3 with non-constant or "
++      UNREACHABLE("a5xx load_global_ir3 with non-constant or "
 +                  "out-of-immediate-range offset (LDG_A is a6xx+ only)");
 +   }
 +
@@ -81,15 +83,14 @@ src/freedreno/ir3/ir3_compiler_nir.c:2798 in emit_intrinsic.
 +   struct ir3_instruction *value, *addr;
 +   unsigned ncomp = nir_intrinsic_src_components(intr, 0);
 +
-+   addr = ir3_collect(b, ir3_get_src(ctx, &intr->src[1])[0],
-+                      ir3_get_src(ctx, &intr->src[1])[1]);
++   addr = ir3_collect(b, ir3_get_src(ctx, &intr->src[1])[0]);
 +
 +   value = ir3_create_collect(b, ir3_get_src(ctx, &intr->src[0]), ncomp);
 +
 +   if (!nir_src_is_const(intr->src[2]) ||
 +       nir_src_as_int(intr->src[2]) >= (1 << 10) ||
 +       nir_src_as_int(intr->src[2]) <= -(1 << 10)) {
-+      unreachable("a5xx store_global_ir3 with non-constant or "
++      UNREACHABLE("a5xx store_global_ir3 with non-constant or "
 +                  "out-of-immediate-range offset (STG_A is a6xx+ only)");
 +   }
 +
@@ -111,7 +112,7 @@ src/freedreno/ir3/ir3_compiler_nir.c:2798 in emit_intrinsic.
  const struct ir3_context_funcs ir3_a4xx_funcs = {
     .emit_intrinsic_load_ssbo = emit_intrinsic_load_ssbo,
     .emit_intrinsic_store_ssbo = emit_intrinsic_store_ssbo,
-@@ -391,7 +465,7 @@ const struct ir3_context_funcs ir3_a4xx_funcs = {
+@@ -391,7 +463,7 @@
     .emit_intrinsic_store_image = emit_intrinsic_store_image,
     .emit_intrinsic_atomic_image = emit_intrinsic_atomic_image,
     .emit_intrinsic_image_size = emit_intrinsic_image_size_tex,
