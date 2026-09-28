@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.1
+
+Audio through the WCD9335 codec, and an ops.fw task to grow `/data`.
+
+### Added
+
+- Kernel with SLIMbus audio: the WCD9335 codec now works through the ADSP
+  (loudspeaker, earpiece and microphone), using a new MSM8953
+  SLIMbus NGD satellite controller driver.
+- `grow-app` ops.fw task: rewrites the partition table so the application
+  partition fills the rest of `userdata`. `nerves_data_resize` runs it
+  before growing the filesystem.
+
 ## v0.2.0
 
 Moves to the current official Nerves platform (with PR #4) and drops the
