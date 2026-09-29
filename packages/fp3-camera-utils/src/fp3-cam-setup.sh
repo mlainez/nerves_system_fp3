@@ -52,12 +52,15 @@ modprobe venus-dec 2>/dev/null
 mc_link() { media-ctl -d "$MEDIA" -l "$1" >/dev/null 2>&1; }
 mc_fmt()  { media-ctl -d "$MEDIA" -V "$1" >/dev/null 2>&1; }
 
-# Name of the sensor entity sitting on a given i2c bus-address, as the
-# media graph reports it, e.g. "imx363 3-0010". Empty if that slot is
-# not populated.
+# Name of the sensor entity on a given i2c bus, as the media graph
+# reports it, e.g. "imx363 3-001a". Matched on the bus, not the
+# address: the address depends on the fitted module, and IMX363 rear
+# modules have been seen at 0x1a as well as 0x10. The "(1 pad"
+# match skips the lens and flash entities on the same bus. Empty if
+# that slot is not populated.
 sensor_entity() {
 	media-ctl -d "$MEDIA" -p 2>/dev/null |
-		sed -n "s/^- entity [0-9]*: \([^(]*$1\) (.*/\1/p" |
+		sed -n "s/^- entity [0-9]*: \([^(]*$1-00[0-9a-f][0-9a-f]\) (1 pad.*/\1/p" |
 		sed 's/[[:space:]]*$//' | head -1
 }
 
@@ -105,10 +108,10 @@ setup_cam() {
 	which="$1"; want_binned="$2"
 
 	if [ "$which" = rear ]; then
-		addr=3-0010; phy=msm_csiphy0; csid=msm_csid0
+		bus=3; phy=msm_csiphy0; csid=msm_csid0
 		ispif=msm_ispif0; rdi=msm_vfe0_rdi0; vnode=msm_vfe0_video0
 	else
-		addr=4-0010; phy=msm_csiphy2; csid=msm_csid1
+		bus=4; phy=msm_csiphy2; csid=msm_csid1
 		ispif=msm_ispif1; rdi=msm_vfe0_rdi1; vnode=msm_vfe0_video1
 	fi
 
@@ -118,11 +121,12 @@ setup_cam() {
 		return 1
 	fi
 
-	entity=$(sensor_entity "$addr")
+	entity=$(sensor_entity "$bus")
 	if [ -z "$entity" ]; then
 		echo "fp3-cam-setup: no $which sensor in the media graph" >&2
 		return 1
 	fi
+	addr=${entity##* }
 	if ! sensor_profile "$entity"; then
 		echo "fp3-cam-setup: unknown $which sensor '$entity'" >&2
 		return 1
