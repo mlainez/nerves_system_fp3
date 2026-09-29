@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.2
+
+### Fixed
+
+- `fp3-cam-setup` finds the camera sensors by I2C bus instead of a fixed
+  address, so phones whose IMX363 registers at `3-001a` rather than
+  `3-0010` no longer fail with "no rear sensor in the media graph".
+
 ## v0.2.1
 
 Audio through the WCD9335 codec, and an ops.fw task to grow `/data`.
