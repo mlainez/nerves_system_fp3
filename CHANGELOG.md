@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.3
+
+### Fixed
+
+- Earpiece and headphone jack audio on the Fairphone 3+. The TAS2557
+  loudspeaker-amp overlay redeclared `audio-routing`, `widgets` and
+  `pin-switches` on the sound card to add the Speaker route; a devicetree
+  overlay replaces a property rather than merging it, so this silently
+  dropped the Earpiece, Headphone Jack and microphone routes the base
+  tree defines. v0.2.1's SLIMbus audio only ever worked through the
+  loudspeaker on a Fairphone 3+.
+
 ## v0.2.2
 
 ### Fixed
