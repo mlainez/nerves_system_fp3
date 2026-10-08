@@ -1,0 +1,44 @@
+Subject: [PATCH] freedreno: count depth/stencil samples once in GMEM layout
+
+The resource layout's cpp already includes its sample count. Multiplying
+it by the framebuffer sample count again overestimates depth/stencil GMEM
+storage: a four-byte Z24S8 attachment at 4x MSAA is accounted as 64 bytes
+per pixel instead of 16.
+
+On the Fairphone 3's Adreno 506 (136 KiB GMEM), the reported 64x32 batch
+with color cpp=4 and Z/S cpp=64 needs 144 KiB after 16 KiB alignment. Even
+the minimum tile cannot fit, so calc_nbins() keeps searching until integer
+overflow. Correct Z/S accounting reduces that layout to 48 KiB.
+
+Compute bytes per sample from each plane's layout format, then multiply
+by framebuffer samples once, as the color-buffer path already does. Use
+the separate stencil plane's own format, and retain the framebuffer sample
+count rather than assuming it always equals the resource sample count.
+
+This fixes the inflated accounting, not the separate need to bound the
+tile search for genuinely impossible layouts.
+
+Target: Mesa 26.1.8
+Link: https://github.com/emerge-elixir/emerge/issues/82
+Upstream-Status: Pending
+
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -462,9 +462,15 @@
+ 
+    if (has_zs || assume_zs) {
+       struct fd_resource *rsc = fd_resource(pfb->zsbuf.texture);
+-      key->zsbuf_cpp[0] = rsc->layout.cpp * pfb->samples;
++      /* layout.cpp already includes the resource's sample count.  Start
++       * from each plane's format so framebuffer samples are counted once,
++       * just as for color buffers below.
++       */
++      key->zsbuf_cpp[0] =
++         util_format_get_blocksize(rsc->layout.format) * pfb->samples;
+       if (rsc->stencil)
+-         key->zsbuf_cpp[1] = rsc->stencil->layout.cpp * pfb->samples;
++         key->zsbuf_cpp[1] =
++            util_format_get_blocksize(rsc->stencil->layout.format) * pfb->samples;
+ 
+       /* If we clear z or s but not both, and we are using z24s8 (ie.
+        * !separate_stencil) then we need to restore the other, even if
