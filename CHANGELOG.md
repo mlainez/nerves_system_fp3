@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Mesa (freedreno): a GL app could hang a thread at 100% CPU for tens of
+  seconds or more per frame on the Adreno 506. For small render targets
+  with deep MSAA depth/stencil buffers, even the smallest GMEM bins don't
+  fit the 136 KB of GMEM, and `calc_nbins()` searched until it overflowed.
+  Such batches now render in sysmem instead
+  (`patches/mesa3d/0001-freedreno-fall-back-to-sysmem-when-no-bins-fit-in-GMEM.patch`).
+  Apps that set `FD_MESA_DEBUG=sysmem` to avoid the hang can drop it.
+
 ## v0.2.2
 
 ### Fixed
