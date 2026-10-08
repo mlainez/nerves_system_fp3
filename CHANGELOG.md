@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Mesa Freedreno counted depth/stencil MSAA samples twice when sizing GMEM
+  tiles, making an ordinary 4x MSAA batch appear too large for the Adreno
+  506's 136 KiB of GMEM. This could leave Emerge's OpenGL render thread
+  spinning in the tile-size search. Count samples once for both depth and
+  separate stencil planes.
+
 ## v0.2.3
 
 ### Fixed
