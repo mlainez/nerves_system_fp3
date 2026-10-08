@@ -1,0 +1,101 @@
+From: Lars Wikman <lars@underjord.io>
+Subject: [PATCH] freedreno: fall back to sysmem when no bins fit in GMEM
+
+calc_nbins() keeps adding bins until layout_gmem() fits. When even the
+smallest bins (one tile-alignment unit) can't fit, which happens on GPUs
+with little GMEM for small render targets with deep MSAA depth/stencil
+buffers, the loop never succeeds: it runs ~2^32 iterations until
+DIV_ROUND_UP() overflows and yields a 0-sized bin, hanging the calling
+thread for tens of seconds or more per batch.
+
+Seen on the Adreno 506 (136 KB GMEM): a 64x32 framebuffer with a 4 cpp
+color buffer and a 64 cpp depth/stencil buffer needs 144 KB at the
+minimum 64x32 bin.
+
+Check the smallest bins first. If they don't fit, keep a minimal layout,
+mark the gmem state as not fitting, and render that batch in sysmem
+(bypass) mode on generations that support it.
+
+Upstream-Status: Pending
+---
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c	2026-10-07 20:25:06
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c	2026-10-07 20:25:06
+@@ -200,7 +200,7 @@
+    return total <= screen->gmemsize_bytes;
+ }
+ 
+-static void
++static bool
+ calc_nbins(struct gmem_key *key, struct fd_gmem_stateobj *gmem)
+ {
+    struct fd_screen *screen = gmem->screen;
+@@ -229,6 +229,21 @@
+       nbins_y++;
+    }
+ 
++   /* If even the smallest possible bins don't fit (for example a small
++    * render target with a deep MSAA depth/stencil buffer on a GPU with
++    * little GMEM), no number of bins will, and the search below would
++    * never terminate. Lay out the smallest bins so the state is sane, and
++    * let the caller fall back to sysmem:
++    */
++   uint32_t min_nbins_x = MAX2(DIV_ROUND_UP(key->width, screen->info->tile_align_w), 1);
++   uint32_t min_nbins_y = MAX2(DIV_ROUND_UP(key->height, screen->info->tile_align_h), 1);
++   if (!layout_gmem(key, min_nbins_x, min_nbins_y, gmem)) {
++      mesa_logw("freedreno: %ux%u framebuffer (cbuf cpp %u, zsbuf cpp %u) "
++                "doesn't fit in GMEM, using sysmem",
++                key->width, key->height, key->cbuf_cpp[0], key->zsbuf_cpp[0]);
++      return false;
++   }
++
+    /* then find a bin width/height that satisfies the memory
+     * constraints:
+     */
+@@ -254,6 +269,7 @@
+    }
+ 
+    layout_gmem(key, nbins_x, nbins_y, gmem);
++   return true;
+ }
+ 
+ static struct fd_gmem_stateobj *
+@@ -271,7 +287,7 @@
+    uint32_t tpp_x, tpp_y;
+    int tile_n[npipes];
+ 
+-   calc_nbins(key, gmem);
++   gmem->fits = calc_nbins(key, gmem);
+ 
+    DBG("using %d bins of size %dx%d", gmem->nbins_x * gmem->nbins_y,
+        gmem->bin_w, gmem->bin_h);
+@@ -734,6 +750,16 @@
+ 
+    if (FD_DBG(SYSMEM))
+       sysmem = true;
++
++   /* A framebuffer that can't be binned at all has to bypass GMEM: */
++   if (!sysmem && !batch->nondraw && ctx->emit_sysmem_prep) {
++      struct fd_gmem_stateobj *gmem = lookup_gmem_state(batch, false, false);
++      if (!gmem->fits)
++         sysmem = true;
++      fd_screen_lock(ctx->screen);
++      fd_gmem_reference(&gmem, NULL);
++      fd_screen_unlock(ctx->screen);
++   }
+ 
+    /* Layered rendering always needs bypass. */
+    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.h	2026-10-07 20:25:06
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.h	2026-10-07 20:25:06
+@@ -45,6 +45,11 @@
+    uint16_t maxpw, maxph; /* maximum pipe width/height */
+    uint8_t num_vsc_pipes; /* number of pipes for a20x */
+ 
++   /* False when even the smallest bins don't fit in GMEM, in which case
++    * the batch has to be rendered in sysmem (bypass) mode:
++    */
++   bool fits;
++
+    struct fd_vsc_pipe vsc_pipe[32];
+    struct fd_tile *tile;
+ 
