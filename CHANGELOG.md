@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.4
+
+### Fixed
+
+- Earpiece and microphone on the Fairphone 3+. The WCD9335 register map
+  cached its page selector, which the ADSP moves when it starts a
+  SLIMbus port, so the earpiece amplifier, interpolator clock and
+  analog clock writes issued at stream start landed on the wrong page.
+  The selector is now written before every access.
+- A kernel panic in the SLIMbus controller when its DMA completion
+  arrived after the sender had already returned.
+- `/sys/fs/pstore` is mounted at boot, so ramoops panic logs survive a
+  crash and can be read after the reboot.
+
 ## v0.2.3
 
 ### Fixed
