@@ -14,7 +14,7 @@
   with deep MSAA depth/stencil buffers, even the smallest GMEM bins don't
   fit the 136 KB of GMEM, and `calc_nbins()` searched until it overflowed.
   Such batches now render in sysmem instead
-  (`patches/mesa3d/0001-freedreno-fall-back-to-sysmem-when-no-bins-fit-in-GMEM.patch`).
+  (`patches/mesa3d/0002-freedreno-fall-back-to-sysmem-when-no-bins-fit-in-GMEM.patch`).
   Apps that set `FD_MESA_DEBUG=sysmem` to avoid the hang can drop it.
 
 ## v0.2.4
