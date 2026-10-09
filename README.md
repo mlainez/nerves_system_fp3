@@ -100,7 +100,7 @@ node. See each library's README for how it starts and what it needs:
 | [`ex_audio`](https://github.com/mlainez/ex_audio) | `amixer`; ADSP up before the card binds |
 | [`ex_nfc`](https://github.com/mlainez/ex_nfc) | `NETLINK_GENERIC` + the kernel `nfc` family |
 | [`ex_location`](https://github.com/mlainez/ex_location) | QRTR; modem MSS running |
-| [`fp3_camera`](https://github.com/mlainez/fp3_camera) | `fp3-cam-setup` (`media-ctl`), `cam-snap`, `cam-stream` |
+| [`fp3_camera`](https://github.com/mlainez/fp3_camera) | GStreamer `libcamerasrc`, `v4l2h264enc` (Venus), `tcpserversink` |
 | [`fp3_modem`](https://github.com/mlainez/fp3_modem) | QRTR + the IPA data path |
 | [`ex_qbootctl`](https://github.com/mlainez/ex_qbootctl) | `/usr/bin/qbootctl` |
 | [`nerves_data_resize`](https://github.com/mlainez/nerves_data_resize) | `resize.f2fs`, `df`, `mount`, `umount` |
@@ -213,14 +213,15 @@ VintageNet config. Wi-Fi is `wpa_supplicant` + VintageNet.
 **Audio.** `aplay -D plughw:0,0 file.wav`. The amplifier firmware comes from
 the `fp3-firmware` package.
 
-**Camera.** `fp3-cam-setup` configures the CAMSS media graph and resolves
-the fitted module from it — nothing is keyed on slot or on `/dev/videoN`,
-which move between phones and between boots. `cam-snap`, `cam-stream` and
-`cam-grab` capture stills, H.264 and raw Bayer; the
-[`fp3_camera`](https://github.com/mlainez/fp3_camera) library drives them
-from Elixir. Demosaicing is done in software — the msm8953 CPP hardware
-ISP is not driven. Streams are raw H.264 over TCP, so a browser cannot
-open them; use `ffplay tcp://…`.
+**Camera.** libcamera's simple pipeline handler drives the fitted sensors
+through CAMSS, its software ISP demosaics on the CPU — the msm8953 CPP
+hardware ISP is not driven — and Venus encodes H.264. The
+[`fp3_camera`](https://github.com/mlainez/fp3_camera) library builds
+GStreamer pipelines from them. Full-resolution frames need the 256 MB CMA
+area set on the kernel command line. `cam-snap`, `cam-stream` and
+`cam-grab` from `fp3-camera-utils` still capture stills, H.264 and raw
+Bayer without libcamera. Streams are raw H.264 over TCP, so a browser
+cannot open them; use `ffplay tcp://…`.
 
 **Sensors.** The Qualcomm stack runs on the ADSP and surfaces under
 `/sys/bus/iio/devices/`.

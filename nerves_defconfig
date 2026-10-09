@@ -94,10 +94,11 @@ BR2_PACKAGE_LIBV4L=y
 BR2_PACKAGE_LIBV4L_UTILS=y
 BR2_PACKAGE_YAVTA=y
 
-# GStreamer 1.x, for building your own camera/video pipelines from a shell
-# or a Port. The fp3_camera library does not use it: stills and streams go
-# through cam-snap / cam-stream from fp3-camera-utils. The bayer2rgb-neon
-# plugin understands 10-bit packed Bayer (SGRBG10P) off the CAMSS RDI lane.
+# GStreamer 1.x. The fp3_camera library builds its stills and streams from
+# libcamerasrc, v4l2h264enc (Venus) and tcpserversink; the bad debugutils
+# plugin provides the watchdog that ends a stream whose encoder stalls. The
+# bayer2rgb-neon plugin understands 10-bit packed Bayer (SGRBG10P) off the
+# CAMSS RDI lane.
 BR2_PACKAGE_GSTREAMER1=y
 BR2_PACKAGE_GST1_PLUGINS_BASE=y
 BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_APP=y
@@ -120,24 +121,25 @@ BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_AUTODETECT=y
 BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_DEBUGUTILS=y
 BR2_PACKAGE_GST1_PLUGINS_BAD=y
 BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_BAYER=y
+BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_DEBUGUTILS=y
 BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_MPEGTSMUX=y
 BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_VIDEOPARSERS=y
 BR2_PACKAGE_GST1_PLUGINS_BAYER2RGB_NEON=y
 BR2_PACKAGE_GST1_RTSP_SERVER=y
 
 # ffmpeg, for transcoding or remuxing video on the device (for example
-# wrapping cam-stream's raw H.264 in a container). Not used by fp3_camera.
+# wrapping a raw H.264 stream in a container). Not used by fp3_camera.
 # h264_v4l2m2m (Venus) is available because libv4l is enabled above.
 BR2_PACKAGE_FFMPEG=y
 BR2_PACKAGE_FFMPEG_FFMPEG=y
 BR2_PACKAGE_FFMPEG_GPL=y
 BR2_PACKAGE_FFMPEG_SWSCALE=y
 
-# libcamera with its SoftwareISP (3A, black level, colour matrix, gamma),
-# for experimenting with the `cam` CLI. The msm8953 CAMSS exposes only raw
-# Bayer; fp3_camera does its own processing in cam-snap / cam-stream and
-# does not use libcamera. The "simple" pipeline handler matches devices
-# without a vendor ISP.
+# libcamera with its SoftwareISP (3A, black level, colour matrix, gamma).
+# The msm8953 CAMSS exposes only raw Bayer; fp3_camera captures through
+# libcamera's GStreamer element. The "simple" pipeline handler matches
+# devices without a vendor ISP. Full-resolution frames need the 256 MB CMA
+# area set on the kernel command line in extlinux.conf.
 BR2_PACKAGE_LIBCAMERA=y
 BR2_PACKAGE_LIBCAMERA_PIPELINE_SIMPLE=y
 BR2_PACKAGE_LIBCAMERA_V4L2=y
