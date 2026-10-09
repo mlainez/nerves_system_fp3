@@ -1,9 +1,28 @@
 # Changelog
 
-## Unreleased
+## v0.2.4
 
 ### Fixed
 
+- Earpiece and microphone on the Fairphone 3+. The WCD9335 register map
+  cached its page selector, which the ADSP moves when it starts a
+  SLIMbus port, so the earpiece amplifier, interpolator clock and
+  analog clock writes issued at stream start landed on the wrong page.
+  The selector is now written before every access.
+- The first recording after boot was silent on both models; it took a
+  throwaway recording to wake the microphone up. The codec's capture
+  port is now enabled before the SLIMbus connection that activates it.
+- About one boot in seven on a Fairphone 3 recorded only silence for the
+  whole boot. The SLIMbus controller reported a message as sent as soon
+  as it was queued, before it went out on the bus; it now waits for the
+  controller's own completion.
+- The loudspeaker played along with the earpiece on the Fairphone 3+
+  after switching routes. A playback session's mixer switches are now
+  exclusive, so switching to a new output disconnects the old one.
+- A kernel panic in the SLIMbus controller when its DMA completion
+  arrived after the sender had already returned.
+- `/sys/fs/pstore` is mounted at boot, so ramoops panic logs survive a
+  crash and can be read after the reboot.
 - Mesa Freedreno counted depth/stencil MSAA samples twice when sizing GMEM
   tiles, making an ordinary 4x MSAA batch appear too large for the Adreno
   506's 136 KiB of GMEM. This could leave Emerge's OpenGL render thread
@@ -16,20 +35,6 @@
   Such batches now render in sysmem instead
   (`patches/mesa3d/0002-freedreno-fall-back-to-sysmem-when-no-bins-fit-in-GMEM.patch`).
   Apps that set `FD_MESA_DEBUG=sysmem` to avoid the hang can drop it.
-
-## v0.2.4
-
-### Fixed
-
-- Earpiece and microphone on the Fairphone 3+. The WCD9335 register map
-  cached its page selector, which the ADSP moves when it starts a
-  SLIMbus port, so the earpiece amplifier, interpolator clock and
-  analog clock writes issued at stream start landed on the wrong page.
-  The selector is now written before every access.
-- A kernel panic in the SLIMbus controller when its DMA completion
-  arrived after the sender had already returned.
-- `/sys/fs/pstore` is mounted at boot, so ramoops panic logs survive a
-  crash and can be read after the reboot.
 
 ## v0.2.3
 
