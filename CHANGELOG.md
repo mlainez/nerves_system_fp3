@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.3.0
+
+The cameras now run through the phone's camera image processor (the
+msm8953 VFE) instead of software, and video through a working hardware
+encoder.
+
+### Added
+
+- Hardware image processing for all four camera modules (Fairphone 3:
+  IMX363 and S5K4H7YX; Fairphone 3+: S5KGM1SP and S5K3P9SP). The VFE
+  pixel path demosaics, white balances, colour corrects with each
+  sensor's calibrated matrix and black level, gamma corrects, scales and
+  crops every frame and writes NV12. libcamera drives it through a new
+  `camss` pipeline handler and IPA (`patches/libcamera/0006` to `0011`):
+  automatic or manual exposure, gain and white balance, manual focus,
+  frame rate, and digital zoom through the standard `ScalerCrop` control.
+  A 1080p or 4K stream at 30 fps takes about 6% of the CPU.
+- Frames go to the Venus H.264 encoder without a copy when libcamera's
+  `camss.nv12_plane_alignment` option lays them out as Venus reads them.
+- Focus on the Fairphone 3 rear camera: an LC898217XC lens driver, and the
+  IMX363 module that answers at 0x10 now describes that actuator.
+- A 256 MB CMA reservation for full-resolution camera buffers, and the
+  GStreamer watchdog element for camera streams.
+
+### Fixed
+
+- Venus encoder: sessions stalled mid-stream when the firmware power
+  collapsed the codec between frames; bitrates overshot about twelvefold
+  because the firmware budgeted from frame-number timestamps; noisy
+  frames outran the clock table; heavy sessions now use the firmware's
+  power-save mode; a firmware that stops answering is restarted.
+- A camera stream froze for a second whenever its buffers briefly ran
+  out: the VFE could leave its frame-drop pattern unchanged until its
+  counter wrapped.
+- The S5KGM1SP and S5K3P9SP take 0.7 s less to start streaming: their
+  register setfiles are written in bursts.
+- 4000x3000 NV12 frames on the rear Fairphone 3+ camera, which the video
+  node sized too small.
+
+### Changed
+
+- The kernel is built from `linux-msm8953` 6.19 staging `e1d55840ba63`.
+- `fp3_camera` uses the hardware path; `fp3-camera-utils`
+  and the software-ISP libcamera patches (`0001` to `0005`) remain for
+  the older tools.
+
 ## v0.2.4
 
 ### Fixed
