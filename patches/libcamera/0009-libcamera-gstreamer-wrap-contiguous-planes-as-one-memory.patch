@@ -1,0 +1,168 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: gstreamer: wrap contiguous planes as one memory
+
+A frame whose planes follow each other in one dmabuf becomes a single
+GstMemory covering the stream's frame size, and the video meta takes
+the plane offsets from the buffers rather than from the frame size.
+Elements such as V4L2 encoders then import the frame as one dmabuf,
+including any padding a pipeline lays out for them.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ruN a/src/gstreamer/gstlibcameraallocator.cpp b/src/gstreamer/gstlibcameraallocator.cpp
+--- a/src/gstreamer/gstlibcameraallocator.cpp
++++ b/src/gstreamer/gstlibcameraallocator.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "gstlibcameraallocator.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ #include <libcamera/camera.h>
+@@ -35,6 +36,8 @@
+ 		  gpointer stream);
+ 	~FrameWrap();
+ 
++	void addMemory(GstAllocator *allocator, int fd, size_t offset,
++		       size_t length);
+ 	void acquirePlane() { ++outstandingPlanes_; }
+ 	bool releasePlane() { return --outstandingPlanes_ == 0; }
+ 
+@@ -53,16 +56,36 @@
+ 	  buffer_(buffer),
+ 	  outstandingPlanes_(0)
+ {
+-	for (const FrameBuffer::Plane &plane : buffer->planes()) {
+-		GstMemory *mem = gst_fd_allocator_alloc(allocator, plane.fd.get(),
+-							plane.offset + plane.length,
+-							GST_FD_MEMORY_FLAG_DONT_CLOSE);
+-		gst_memory_resize(mem, plane.offset, plane.length);
+-		gst_mini_object_set_qdata(GST_MINI_OBJECT(mem), getQuark(), this, nullptr);
+-		GST_MINI_OBJECT(mem)->dispose = gst_libcamera_allocator_release;
+-		g_object_unref(mem->allocator);
+-		planes_.push_back(mem);
++	/*
++	 * Planes that follow each other in one dmabuf make a single memory,
++	 * which covers the stream's frame size: elements such as V4L2
++	 * encoders import a frame as one dmabuf, and may read past its last
++	 * plane into the padding the stream reserves for them.
++	 */
++	if (gst_libcamera_frame_buffer_is_contiguous(buffer)) {
++		const FrameBuffer::Plane &first = buffer->planes().front();
++		const FrameBuffer::Plane &last = buffer->planes().back();
++		size_t size = std::max<size_t>(last.offset + last.length - first.offset,
++					       static_cast<Stream *>(stream)->configuration().frameSize);
++
++		addMemory(allocator, first.fd.get(), first.offset, size);
++		return;
+ 	}
++
++	for (const FrameBuffer::Plane &plane : buffer->planes())
++		addMemory(allocator, plane.fd.get(), plane.offset, plane.length);
++}
++
++void FrameWrap::addMemory(GstAllocator *allocator, int fd, size_t offset,
++			  size_t length)
++{
++	GstMemory *mem = gst_fd_allocator_alloc(allocator, fd, offset + length,
++						GST_FD_MEMORY_FLAG_DONT_CLOSE);
++	gst_memory_resize(mem, offset, length);
++	gst_mini_object_set_qdata(GST_MINI_OBJECT(mem), getQuark(), this, nullptr);
++	GST_MINI_OBJECT(mem)->dispose = gst_libcamera_allocator_release;
++	g_object_unref(mem->allocator);
++	planes_.push_back(mem);
+ }
+ 
+ FrameWrap::~FrameWrap()
+@@ -253,6 +276,33 @@
+ 	return true;
+ }
+ 
++bool
++gst_libcamera_frame_buffer_is_contiguous(const FrameBuffer *buffer)
++{
++	const auto &planes = buffer->planes();
++
++	for (size_t i = 1; i < planes.size(); i++) {
++		if (planes[i].fd != planes[0].fd ||
++		    planes[i].offset != planes[i - 1].offset + planes[i - 1].length)
++			return false;
++	}
++
++	return true;
++}
++
++FrameBuffer *
++gst_libcamera_allocator_peek_frame_buffer(GstLibcameraAllocator *self,
++					  Stream *stream)
++{
++	GLibLocker lock(GST_OBJECT(self));
++
++	auto *pool = reinterpret_cast<GQueue *>(g_hash_table_lookup(self->pools, stream));
++	g_return_val_if_fail(pool, nullptr);
++
++	auto *frame = reinterpret_cast<FrameWrap *>(g_queue_peek_head(pool));
++	return frame ? frame->buffer_ : nullptr;
++}
++
+ gsize
+ gst_libcamera_allocator_get_pool_size(GstLibcameraAllocator *self,
+ 				      Stream *stream)
+diff -ruN a/src/gstreamer/gstlibcameraallocator.h b/src/gstreamer/gstlibcameraallocator.h
+--- a/src/gstreamer/gstlibcameraallocator.h
++++ b/src/gstreamer/gstlibcameraallocator.h
+@@ -12,6 +12,7 @@
+ #include <gst/allocators/allocators.h>
+ 
+ #include <libcamera/camera.h>
++#include <libcamera/framebuffer.h>
+ #include <libcamera/stream.h>
+ 
+ #define GST_TYPE_LIBCAMERA_ALLOCATOR gst_libcamera_allocator_get_type()
+@@ -25,6 +26,11 @@
+ 					    libcamera::Stream *stream,
+ 					    GstBuffer *buffer);
+ 
++bool gst_libcamera_frame_buffer_is_contiguous(const libcamera::FrameBuffer *buffer);
++
++libcamera::FrameBuffer *gst_libcamera_allocator_peek_frame_buffer(GstLibcameraAllocator *self,
++								  libcamera::Stream *stream);
++
+ gsize gst_libcamera_allocator_get_pool_size(GstLibcameraAllocator *allocator,
+ 					    libcamera::Stream *stream);
+ 
+diff -ruN a/src/gstreamer/gstlibcamerapool.cpp b/src/gstreamer/gstlibcamerapool.cpp
+--- a/src/gstreamer/gstlibcamerapool.cpp
++++ b/src/gstreamer/gstlibcamerapool.cpp
+@@ -154,10 +154,29 @@
+ 	pool->allocator = GST_LIBCAMERA_ALLOCATOR(g_object_ref(allocator));
+ 	pool->stream = stream;
+ 
++	/*
++	 * Describe the planes where the buffers hold them, which may be
++	 * further apart than the frame size implies, as when a pipeline
++	 * pads the planes for a hardware encoder.
++	 */
++	GstVideoInfo layout = *info;
++	FrameBuffer *frame = gst_libcamera_allocator_peek_frame_buffer(allocator, stream);
++	if (frame && frame->planes().size() == GST_VIDEO_INFO_N_PLANES(info)) {
++		const auto &planes = frame->planes();
++		bool contiguous = gst_libcamera_frame_buffer_is_contiguous(frame);
++		gsize offset = 0;
++
++		for (guint i = 0; i < planes.size(); i++) {
++			layout.offset[i] = contiguous ? planes[i].offset - planes[0].offset
++						      : offset;
++			offset += planes[i].length;
++		}
++	}
++
+ 	gsize pool_size = gst_libcamera_allocator_get_pool_size(allocator, stream);
+ 	for (gsize i = 0; i < pool_size; i++) {
+ 		GstBuffer *buffer = gst_buffer_new();
+-		gst_libcamera_buffer_add_video_meta(buffer, info);
++		gst_libcamera_buffer_add_video_meta(buffer, &layout);
+ 		pool->queue->push_back(buffer);
+ 	}
+ 
