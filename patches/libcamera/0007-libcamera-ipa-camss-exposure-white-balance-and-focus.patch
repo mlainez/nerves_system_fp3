@@ -1,0 +1,988 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: ipa: camss: exposure, white balance and focus
+
+Add an IPA for the camss pipeline handler. It regulates the sensor's
+exposure time, analogue gain and frame length, the VFE white balance
+gains and the lens position, each from the application's manual value
+when it sets one: ExposureTimeMode, ExposureTime, AnalogueGainMode,
+AnalogueGain, AwbEnable, ColourGains, FrameDurationLimits, AfMode and
+LensPosition.
+
+Auto exposure aims the mean linear luminance at mid grey and backs off
+from clipping; auto white balance is grey world. The pipeline handler
+feeds both from a grid of samples of each NV12 output frame.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ruN a/include/libcamera/ipa/camss.mojom b/include/libcamera/ipa/camss.mojom
+--- a/include/libcamera/ipa/camss.mojom
++++ b/include/libcamera/ipa/camss.mojom
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++
++/*
++ * \todo Document the interface and remove the related EXCLUDE_PATTERNS entry.
++ */
++
++module ipa.camss;
++
++import "include/libcamera/ipa/core.mojom";
++
++struct IPAConfigInfo {
++	libcamera.IPACameraSensorInfo sensorInfo;
++	libcamera.ControlInfoMap sensorControls;
++	libcamera.ControlInfoMap lensControls;
++};
++
++/*
++ * Statistics of a frame: the mean linear R, G and B of its mid tones, and
++ * a histogram of its linear luminance.
++ */
++struct IPACamssStats {
++	float r;
++	float g;
++	float b;
++	array<uint32> histogram;
++};
++
++interface IPACamssInterface {
++	init(libcamera.IPASettings settings,
++	     libcamera.IPACameraSensorInfo sensorInfo,
++	     libcamera.ControlInfoMap sensorControls,
++	     libcamera.ControlInfoMap lensControls)
++		=> (int32 ret, libcamera.ControlInfoMap ipaControls);
++	configure(IPAConfigInfo configInfo) => (int32 ret);
++
++	start(libcamera.ControlList controls) => (int32 ret);
++	stop();
++
++	[async] queueRequest(uint32 frame, libcamera.ControlList controls);
++	[async] processStats(uint32 frame, IPACamssStats stats,
++			     libcamera.ControlList sensorControls);
++};
++
++interface IPACamssEventInterface {
++	setSensorControls(libcamera.ControlList sensorControls);
++	setLensControls(libcamera.ControlList lensControls);
++	setWbGains(uint32 red, uint32 blue);
++	metadataReady(uint32 frame, libcamera.ControlList metadata);
++};
+diff -ruN a/include/libcamera/ipa/meson.build b/include/libcamera/ipa/meson.build
+--- a/include/libcamera/ipa/meson.build
++++ b/include/libcamera/ipa/meson.build
+@@ -63,6 +63,7 @@
+ 
+ # Mapping from pipeline handler name to mojom file
+ pipeline_ipa_mojom_mapping = {
++    'camss': 'camss.mojom',
+     'ipu3': 'ipu3.mojom',
+     'mali-c55': 'mali-c55.mojom',
+     'rkisp1': 'rkisp1.mojom',
+diff -ruN a/meson_options.txt b/meson_options.txt
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -48,7 +48,7 @@
+ 
+ option('ipas',
+         type : 'array',
+-        choices : ['ipu3', 'mali-c55', 'rkisp1', 'rpi/pisp', 'rpi/vc4', 'simple',
++        choices : ['camss', 'ipu3', 'mali-c55', 'rkisp1', 'rpi/pisp', 'rpi/vc4', 'simple',
+                    'vimc'],
+         description : 'Select which IPA modules to build')
+ 
+diff -ruN a/src/ipa/camss/camss.cpp b/src/ipa/camss/camss.cpp
+--- a/src/ipa/camss/camss.cpp
++++ b/src/ipa/camss/camss.cpp
+@@ -0,0 +1,467 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Image processing algorithms for the Qualcomm camss VFE pixel path
++ *
++ * The VFE debayers, white balances, colour corrects and gamma corrects in
++ * hardware. This IPA regulates what it cannot: the sensor's exposure time,
++ * analogue gain and frame length, the VFE white balance gains, and the lens
++ * position. Each of them follows the application's manual value when it
++ * sets one.
++ */
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <memory>
++#include <optional>
++#include <stdint.h>
++#include <vector>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++
++#include <libcamera/ipa/camss_ipa_interface.h>
++#include <libcamera/ipa/ipa_interface.h>
++#include <libcamera/ipa/ipa_module_info.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "libipa/camera_sensor_helper.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPACamss)
++
++using namespace std::literals::chrono_literals;
++
++namespace ipa::camss {
++
++namespace {
++
++/* Mean linear luminance exposure aims for: mid grey */
++constexpr double kTarget = 0.18;
++
++/* Share of pixels in the top luminance bin exposure backs off from */
++constexpr double kClipped = 0.02;
++
++/* Fraction of the correction, in log space, applied per adjustment */
++constexpr double kAgcSpeed = 0.6;
++constexpr double kAwbSpeed = 0.3;
++
++/* Frames a sensor change takes to show in the statistics */
++constexpr unsigned int kSensorDelay = 2;
++
++constexpr double kGainMax = 16.0;
++constexpr double kWbMin = 1.0;
++constexpr double kWbMax = 3.99;
++
++/* VFE white balance gains are Q7 */
++constexpr double kWbUnit = 128.0;
++
++/* Lens positions in dioptres, the driver's focus range in steps */
++constexpr float kLensDioptresMax = 10.0f;
++
++constexpr utils::Duration kDefaultFrameDuration = 33333us;
++
++} /* namespace */
++
++class IPACamss : public IPACamssInterface
++{
++public:
++	int init(const IPASettings &settings,
++		 const IPACameraSensorInfo &sensorInfo,
++		 const ControlInfoMap &sensorControls,
++		 const ControlInfoMap &lensControls,
++		 ControlInfoMap *ipaControls) override;
++	int configure(const IPAConfigInfo &configInfo) override;
++
++	int start(const ControlList &controls) override;
++	void stop() override {}
++
++	void queueRequest(const uint32_t frame, const ControlList &controls) override;
++	void processStats(const uint32_t frame, const IPACamssStats &stats,
++			  const ControlList &sensorControls) override;
++
++private:
++	bool applyControls(const ControlList &controls);
++	void setFrameDuration(utils::Duration duration);
++	int32_t exposureMax() const;
++
++	void expose(const IPACamssStats &stats);
++	void balance(const IPACamssStats &stats);
++
++	void writeSensor();
++	void writeWb();
++	void writeLens();
++
++	std::unique_ptr<CameraSensorHelper> camHelper_;
++	ControlInfoMap sensorControls_;
++	ControlInfoMap lensControls_;
++	int32_t lensMax_ = 0;
++
++	/* Sensor mode */
++	utils::Duration lineDuration_;
++	int32_t height_ = 0;
++	int32_t vblankMin_ = 0;
++	int32_t vblankMax_ = 0;
++	int32_t exposureMin_ = 1;
++	int32_t exposureMargin_ = 0;
++	double gainMin_ = 1.0;
++	double gainMax_ = kGainMax;
++
++	/* What the sensor, VFE and lens are set to */
++	int32_t vblank_ = 0;
++	int32_t exposure_ = 0;
++	double gain_ = 1.0;
++	double wbRed_ = 1.0;
++	double wbBlue_ = 1.0;
++	std::optional<float> lensPosition_;
++
++	bool autoExposure_ = true;
++	bool autoGain_ = true;
++	bool autoWb_ = true;
++	unsigned int settle_ = 0;
++
++	double initialRed_ = 1.8;
++	double initialBlue_ = 1.7;
++};
++
++int IPACamss::init(const IPASettings &settings,
++		   [[maybe_unused]] const IPACameraSensorInfo &sensorInfo,
++		   const ControlInfoMap &sensorControls,
++		   const ControlInfoMap &lensControls,
++		   ControlInfoMap *ipaControls)
++{
++	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
++	if (!camHelper_)
++		LOG(IPACamss, Warning)
++			<< "No sensor helper for " << settings.sensorModel
++			<< ", gains are raw codes";
++
++	if (sensorControls.find(V4L2_CID_EXPOSURE) == sensorControls.end() ||
++	    sensorControls.find(V4L2_CID_ANALOGUE_GAIN) == sensorControls.end() ||
++	    sensorControls.find(V4L2_CID_VBLANK) == sensorControls.end()) {
++		LOG(IPACamss, Error) << "The sensor lacks exposure, gain or blanking controls";
++		return -EINVAL;
++	}
++
++	/* White balance gains to start from, from the tuning file */
++	File file(settings.configurationFile);
++	if (file.open(File::OpenModeFlag::ReadOnly)) {
++		std::unique_ptr<ValueNode> data = YamlParser::parse(file);
++		if (data && data->contains("awb")) {
++			const ValueNode &awb = (*data)["awb"];
++			initialRed_ = awb["initialRed"].get<double>(initialRed_);
++			initialBlue_ = awb["initialBlue"].get<double>(initialBlue_);
++		}
++	}
++
++	ControlInfoMap::Map ctrls;
++
++	ctrls[&controls::ExposureTimeMode] =
++		ControlInfo({ { ControlValue(controls::ExposureTimeModeAuto),
++				ControlValue(controls::ExposureTimeModeManual) } },
++			    ControlValue(controls::ExposureTimeModeAuto));
++	ctrls[&controls::ExposureTime] =
++		ControlInfo(int32_t{ 1 }, int32_t{ 1000000 }, int32_t{ 10000 });
++	ctrls[&controls::AnalogueGainMode] =
++		ControlInfo({ { ControlValue(controls::AnalogueGainModeAuto),
++				ControlValue(controls::AnalogueGainModeManual) } },
++			    ControlValue(controls::AnalogueGainModeAuto));
++	ctrls[&controls::AnalogueGain] = ControlInfo(1.0f, static_cast<float>(kGainMax), 1.0f);
++	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
++	ctrls[&controls::ColourGains] =
++		ControlInfo(static_cast<float>(kWbMin), static_cast<float>(kWbMax), 1.0f);
++	ctrls[&controls::FrameDurationLimits] =
++		ControlInfo(int64_t{ 1000 }, int64_t{ 1000000 },
++			    static_cast<int64_t>(kDefaultFrameDuration.get<std::micro>()));
++
++	auto focus = lensControls.find(V4L2_CID_FOCUS_ABSOLUTE);
++	if (focus != lensControls.end()) {
++		lensControls_ = lensControls;
++		lensMax_ = focus->second.max().get<int32_t>();
++		ctrls[&controls::LensPosition] = ControlInfo(0.0f, kLensDioptresMax, 0.0f);
++		static const std::array<ControlValue, 1> afModes = {
++			ControlValue(controls::AfModeManual)
++		};
++		ctrls[&controls::AfMode] =
++			ControlInfo(afModes, ControlValue(controls::AfModeManual));
++	}
++
++	*ipaControls = ControlInfoMap(std::move(ctrls), controls::controls);
++
++	return 0;
++}
++
++int IPACamss::configure(const IPAConfigInfo &configInfo)
++{
++	const IPACameraSensorInfo &info = configInfo.sensorInfo;
++	sensorControls_ = configInfo.sensorControls;
++
++	lineDuration_ = info.minLineLength * 1.0s / info.pixelRate;
++	height_ = info.outputSize.height;
++
++	const ControlInfo &vblank = sensorControls_.find(V4L2_CID_VBLANK)->second;
++	const ControlInfo &exposure = sensorControls_.find(V4L2_CID_EXPOSURE)->second;
++	const ControlInfo &gain = sensorControls_.find(V4L2_CID_ANALOGUE_GAIN)->second;
++
++	vblankMin_ = vblank.min().get<int32_t>();
++	vblankMax_ = vblank.max().get<int32_t>();
++	exposureMin_ = std::max(exposure.min().get<int32_t>(), 1);
++
++	/* The exposure limit trails the frame length by a sensor margin */
++	exposureMargin_ = std::max(height_ + vblank.def().get<int32_t>() -
++					   exposure.max().get<int32_t>(),
++				   0);
++
++	if (camHelper_) {
++		gainMin_ = std::max(camHelper_->gain(gain.min().get<int32_t>()), 1.0);
++		gainMax_ = std::min(camHelper_->gain(gain.max().get<int32_t>()), kGainMax);
++	}
++
++	setFrameDuration(kDefaultFrameDuration);
++	exposure_ = exposureMax() / 2;
++	gain_ = gainMin_;
++	wbRed_ = initialRed_;
++	wbBlue_ = initialBlue_;
++	settle_ = 0;
++
++	return 0;
++}
++
++int IPACamss::start(const ControlList &controls)
++{
++	applyControls(controls);
++	writeSensor();
++	writeWb();
++	writeLens();
++
++	return 0;
++}
++
++void IPACamss::queueRequest([[maybe_unused]] const uint32_t frame,
++			    const ControlList &controls)
++{
++	if (applyControls(controls)) {
++		writeSensor();
++		writeWb();
++		writeLens();
++	}
++}
++
++void IPACamss::processStats(const uint32_t frame, const IPACamssStats &stats,
++			    [[maybe_unused]] const ControlList &sensorControls)
++{
++	if (!stats.histogram.empty()) {
++		expose(stats);
++		balance(stats);
++	}
++
++	ControlList metadata(controls::controls);
++	metadata.set(controls::ExposureTime,
++		     static_cast<int32_t>(utils::Duration(exposure_ * lineDuration_).get<std::micro>()));
++	metadata.set(controls::AnalogueGain, static_cast<float>(gain_));
++	metadata.set(controls::ColourGains, { static_cast<float>(wbRed_),
++					      static_cast<float>(wbBlue_) });
++	metadata.set(controls::FrameDuration,
++		     static_cast<int64_t>(utils::Duration((height_ + vblank_) * lineDuration_).get<std::micro>()));
++	if (lensPosition_)
++		metadata.set(controls::LensPosition, *lensPosition_);
++
++	metadataReady.emit(frame, metadata);
++}
++
++/* Returns whether any setting changed. */
++bool IPACamss::applyControls(const ControlList &controls)
++{
++	bool changed = false;
++
++	const auto &limits = controls.get(controls::FrameDurationLimits);
++	if (limits) {
++		setFrameDuration((*limits)[1] * 1us);
++		changed = true;
++	}
++
++	const auto &exposureMode = controls.get(controls::ExposureTimeMode);
++	if (exposureMode) {
++		autoExposure_ = *exposureMode == controls::ExposureTimeModeAuto;
++		changed = true;
++	}
++
++	const auto &exposureTime = controls.get(controls::ExposureTime);
++	if (exposureTime && !autoExposure_) {
++		exposure_ = std::clamp<int32_t>(std::lround(*exposureTime * 1us / lineDuration_),
++						exposureMin_, exposureMax());
++		changed = true;
++	}
++
++	const auto &gainMode = controls.get(controls::AnalogueGainMode);
++	if (gainMode) {
++		autoGain_ = *gainMode == controls::AnalogueGainModeAuto;
++		changed = true;
++	}
++
++	const auto &gain = controls.get(controls::AnalogueGain);
++	if (gain && !autoGain_) {
++		gain_ = std::clamp<double>(*gain, gainMin_, gainMax_);
++		changed = true;
++	}
++
++	const auto &awbEnable = controls.get(controls::AwbEnable);
++	if (awbEnable) {
++		autoWb_ = *awbEnable;
++		changed = true;
++	}
++
++	const auto &colourGains = controls.get(controls::ColourGains);
++	if (colourGains && !autoWb_) {
++		wbRed_ = std::clamp<double>((*colourGains)[0], kWbMin, kWbMax);
++		wbBlue_ = std::clamp<double>((*colourGains)[1], kWbMin, kWbMax);
++		changed = true;
++	}
++
++	const auto &lensPosition = controls.get(controls::LensPosition);
++	if (lensPosition && lensMax_) {
++		lensPosition_ = std::clamp(*lensPosition, 0.0f, kLensDioptresMax);
++		changed = true;
++	}
++
++	return changed;
++}
++
++/* The longest frame the limits allow, which leaves the most exposure time */
++void IPACamss::setFrameDuration(utils::Duration duration)
++{
++	int32_t lines = duration / lineDuration_;
++	vblank_ = std::clamp(lines - height_, vblankMin_, vblankMax_);
++	exposure_ = std::min(exposure_, exposureMax());
++}
++
++int32_t IPACamss::exposureMax() const
++{
++	return std::max(height_ + vblank_ - exposureMargin_, exposureMin_);
++}
++
++/* Exposure time first, up to the frame length, then analogue gain. */
++void IPACamss::expose(const IPACamssStats &stats)
++{
++	if (!autoExposure_ && !autoGain_)
++		return;
++
++	if (settle_) {
++		settle_--;
++		return;
++	}
++
++	const std::vector<uint32_t> &hist = stats.histogram;
++	uint64_t total = 0;
++	double sum = 0;
++	for (unsigned int i = 0; i < hist.size(); i++) {
++		total += hist[i];
++		sum += hist[i] * (i + 0.5) / hist.size();
++	}
++	if (!total)
++		return;
++
++	double mean = sum / total;
++	double clipped = static_cast<double>(hist.back()) / total;
++
++	double ratio = std::clamp(kTarget / std::max(mean, 1e-4), 0.25, 4.0);
++	if (clipped > kClipped)
++		ratio = std::min(ratio, 0.8);
++
++	double target = exposure_ * gain_ * std::pow(ratio, kAgcSpeed);
++	int32_t exposure = exposure_;
++	double gain = gain_;
++
++	if (autoExposure_) {
++		double rest = autoGain_ ? gainMin_ : gain_;
++		exposure = std::clamp<int32_t>(std::lround(target / rest), exposureMin_,
++					       exposureMax());
++	}
++
++	if (autoGain_)
++		gain = std::clamp(target / exposure, gainMin_, gainMax_);
++
++	if (std::abs(exposure * gain / (exposure_ * gain_) - 1.0) < 0.03)
++		return;
++
++	exposure_ = exposure;
++	gain_ = gain;
++	writeSensor();
++	settle_ = kSensorDelay;
++}
++
++/* Grey world: the mean of the mid tones should be neutral. */
++void IPACamss::balance(const IPACamssStats &stats)
++{
++	if (!autoWb_ || stats.r <= 0 || stats.g <= 0 || stats.b <= 0)
++		return;
++
++	double red = std::clamp(wbRed_ * std::pow(stats.g / stats.r, kAwbSpeed), kWbMin, kWbMax);
++	double blue = std::clamp(wbBlue_ * std::pow(stats.g / stats.b, kAwbSpeed), kWbMin, kWbMax);
++
++	if (std::abs(red / wbRed_ - 1.0) < 0.01 && std::abs(blue / wbBlue_ - 1.0) < 0.01)
++		return;
++
++	wbRed_ = red;
++	wbBlue_ = blue;
++	writeWb();
++}
++
++void IPACamss::writeSensor()
++{
++	int32_t code = camHelper_ ? camHelper_->gainCode(gain_) : std::lround(gain_);
++
++	ControlList ctrls(sensorControls_);
++	ctrls.set(V4L2_CID_VBLANK, vblank_);
++	ctrls.set(V4L2_CID_EXPOSURE, exposure_);
++	ctrls.set(V4L2_CID_ANALOGUE_GAIN, code);
++
++	setSensorControls.emit(ctrls);
++}
++
++void IPACamss::writeWb()
++{
++	setWbGains.emit(std::lround(wbRed_ * kWbUnit), std::lround(wbBlue_ * kWbUnit));
++}
++
++void IPACamss::writeLens()
++{
++	if (!lensPosition_ || !lensMax_)
++		return;
++
++	ControlList ctrls(lensControls_);
++	ctrls.set(V4L2_CID_FOCUS_ABSOLUTE,
++		  static_cast<int32_t>(std::lround(*lensPosition_ / kLensDioptresMax * lensMax_)));
++
++	setLensControls.emit(ctrls);
++}
++
++} /* namespace ipa::camss */
++
++/*
++ * External IPA module interface
++ */
++extern "C" {
++const struct IPAModuleInfo ipaModuleInfo = {
++	IPA_MODULE_API_VERSION,
++	0,
++	"camss",
++	"camss",
++};
++
++IPAInterface *ipaCreate()
++{
++	return new ipa::camss::IPACamss();
++}
++
++} /* extern "C" */
++
++} /* namespace libcamera */
+diff -ruN a/src/ipa/camss/data/meson.build b/src/ipa/camss/data/meson.build
+--- a/src/ipa/camss/data/meson.build
++++ b/src/ipa/camss/data/meson.build
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: CC0-1.0
++
++conf_files = files([
++    's5k3p9sp.yaml',
++    's5kgm1sp.yaml',
++    'uncalibrated.yaml',
++])
++
++install_data(conf_files,
++             install_dir : ipa_data_dir / 'camss',
++             install_tag : 'runtime')
+diff -ruN a/src/ipa/camss/data/s5k3p9sp.yaml b/src/ipa/camss/data/s5k3p9sp.yaml
+--- a/src/ipa/camss/data/s5k3p9sp.yaml
++++ b/src/ipa/camss/data/s5k3p9sp.yaml
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++# Samsung S5K3P9SP: white balance starts from its D50 grey reference
++awb:
++  initialRed: 2.43
++  initialBlue: 1.48
++...
+diff -ruN a/src/ipa/camss/data/s5kgm1sp.yaml b/src/ipa/camss/data/s5kgm1sp.yaml
+--- a/src/ipa/camss/data/s5kgm1sp.yaml
++++ b/src/ipa/camss/data/s5kgm1sp.yaml
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++# Samsung S5KGM1SP: white balance starts from its D50 grey reference
++awb:
++  initialRed: 2.0
++  initialBlue: 1.66
++...
+diff -ruN a/src/ipa/camss/data/uncalibrated.yaml b/src/ipa/camss/data/uncalibrated.yaml
+--- a/src/ipa/camss/data/uncalibrated.yaml
++++ b/src/ipa/camss/data/uncalibrated.yaml
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++# White balance gains auto white balance starts from
++awb:
++  initialRed: 1.8
++  initialBlue: 1.7
++...
+diff -ruN a/src/ipa/camss/meson.build b/src/ipa/camss/meson.build
+--- a/src/ipa/camss/meson.build
++++ b/src/ipa/camss/meson.build
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: CC0-1.0
++
++subdir('data')
++
++ipa_name = 'ipa_camss'
++
++mod = shared_module(ipa_name, files('camss.cpp'),
++                    name_prefix : '',
++                    include_directories : [ipa_includes],
++                    dependencies : [libcamera_private, libipa_dep],
++                    install : true,
++                    install_dir : ipa_install_dir)
++
++if ipa_sign_module
++    custom_target(ipa_name + '.so.sign',
++                  input : mod,
++                  output : ipa_name + '.so.sign',
++                  command : [ipa_sign, ipa_priv_key, '@INPUT@', '@OUTPUT@'],
++                  install : false,
++                  build_by_default : true)
++endif
++
++ipa_names += ipa_name
+diff -ruN a/src/libcamera/pipeline/camss/camss.cpp b/src/libcamera/pipeline/camss/camss.cpp
+--- a/src/libcamera/pipeline/camss/camss.cpp
++++ b/src/libcamera/pipeline/camss/camss.cpp
+@@ -5,11 +5,16 @@
+  * The VFE pixel path of camss debayers, white balances, colour corrects and
+  * scales in hardware, and hands out NV12. Each camera takes its own CSID,
+  * ISPIF and VFE, so as many cameras stream at once as the SoC has VFEs.
++ *
++ * The camss IPA regulates exposure, gain, frame length, white balance and
++ * focus. It reads its statistics from a grid of samples of each output
++ * frame.
+  */
+ 
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <map>
+ #include <memory>
+ #include <set>
+ #include <string>
+@@ -26,11 +31,17 @@
+ #include <libcamera/control_ids.h>
+ #include <libcamera/formats.h>
+ #include <libcamera/geometry.h>
++#include <libcamera/ipa/camss_ipa_interface.h>
++#include <libcamera/ipa/camss_ipa_proxy.h>
+ #include <libcamera/ipa/core_ipa_interface.h>
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_lens.h"
++#include "libcamera/internal/camera_manager.h"
+ #include "libcamera/internal/camera_sensor.h"
++#include "libcamera/internal/ipa_manager.h"
++#include "libcamera/internal/mapped_framebuffer.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+@@ -54,7 +65,11 @@
+ constexpr unsigned int kWidthAlign = 16;
+ 
+ constexpr unsigned int kBufferCount = 4;
+-constexpr unsigned int kDefaultFps = 30;
++
++/* Statistics grid and histogram the IPA works from */
++constexpr unsigned int kStatsColumns = 64;
++constexpr unsigned int kStatsRows = 48;
++constexpr unsigned int kHistogramBins = 64;
+ 
+ /* Bayer orders the pixel path debayers */
+ const std::array<unsigned int, 1> kBayerCodes = { MEDIA_BUS_FMT_SGRBG10_1X10 };
+@@ -74,6 +89,65 @@
+ 	return scaled.boundedTo(mode);
+ }
+ 
++/* Linear light of an 8-bit value encoded with the VFE gamma 2.2 curve */
++float linear(int value)
++{
++	static const std::array<float, 256> table = [] {
++		std::array<float, 256> t;
++		for (unsigned int i = 0; i < t.size(); i++)
++			t[i] = std::pow(i / 255.0f, 2.2f);
++		return t;
++	}();
++
++	return table[std::clamp(value, 0, 255)];
++}
++
++/*
++ * Mean linear R, G and B of the mid tones and a histogram of linear
++ * luminance, from a grid of samples of an NV12 frame.
++ */
++ipa::camss::IPACamssStats frameStats(const uint8_t *y, const uint8_t *uv,
++				     const Size &size, unsigned int stride)
++{
++	ipa::camss::IPACamssStats stats{};
++	stats.histogram.assign(kHistogramBins, 0);
++
++	double r = 0, g = 0, b = 0;
++	unsigned int count = 0;
++
++	for (unsigned int row = 0; row < kStatsRows; row++) {
++		unsigned int line = ((2 * row + 1) * size.height / (2 * kStatsRows)) & ~1U;
++
++		for (unsigned int col = 0; col < kStatsColumns; col++) {
++			unsigned int x = ((2 * col + 1) * size.width / (2 * kStatsColumns)) & ~1U;
++			int luma = y[line * stride + x];
++			int u = uv[line / 2 * stride + x] - 128;
++			int v = uv[line / 2 * stride + x + 1] - 128;
++
++			float l = linear(luma);
++			unsigned int bin = std::min<unsigned int>(l * kHistogramBins,
++								  kHistogramBins - 1);
++			stats.histogram[bin]++;
++
++			if (luma < 30 || luma > 230)
++				continue;
++
++			r += linear(std::lround(luma + 1.402 * v));
++			g += linear(std::lround(luma - 0.344 * u - 0.714 * v));
++			b += linear(std::lround(luma + 1.772 * u));
++			count++;
++		}
++	}
++
++	if (count) {
++		stats.r = r / count;
++		stats.g = g / count;
++		stats.b = b / count;
++	}
++
++	return stats;
++}
++
+ } /* namespace */
+ 
+ class PipelineHandlerCamss;
+@@ -89,6 +163,11 @@
+ 	int init(MediaDevice *media, MediaEntity *sensor);
+ 	int setupLinks();
+ 
++	void setSensorControls(const ControlList &sensorControls);
++	void setLensControls(const ControlList &lensControls);
++	void setWbGains(uint32_t red, uint32_t blue);
++	void metadataReady(unsigned int frame, const ControlList &metadata);
++
+ 	/* The sensor modes the pixel path takes, smallest first */
+ 	std::vector<Size> modes() const;
+ 
+@@ -105,6 +184,14 @@
+ 	std::array<MediaLink *, 3> links_;
+ 
+ 	Stream stream_;
++
++	std::unique_ptr<ipa::camss::IPAProxyCamss> ipa_;
++
++	/* Requests whose buffer is done, waiting for the IPA's metadata */
++	std::map<unsigned int, Request *> waiting_;
++
++	/* Output buffers mapped for the statistics, by buffer */
++	std::map<const FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> mappings_;
+ };
+ 
+ class CamssCameraConfiguration : public CameraConfiguration
+@@ -219,9 +306,86 @@
+ 
+ 	properties_ = sensor_->properties();
+ 
++	ipa_ = pipe()->createIPA<ipa::camss::IPAProxyCamss>(0, 0);
++	if (!ipa_) {
++		LOG(Camss, Error) << "No camss IPA";
++		return -ENOENT;
++	}
++
++	ipa_->setSensorControls.connect(this, &CamssCameraData::setSensorControls);
++	ipa_->setLensControls.connect(this, &CamssCameraData::setLensControls);
++	ipa_->setWbGains.connect(this, &CamssCameraData::setWbGains);
++	ipa_->metadataReady.connect(this, &CamssCameraData::metadataReady);
++
++	IPACameraSensorInfo sensorInfo;
++	ret = sensor_->sensorInfo(&sensorInfo);
++	if (ret)
++		return ret;
++
++	CameraLens *lens = sensor_->focusLens();
++	std::string tuning = ipa_->configurationFile(sensor_->model() + ".yaml",
++						     "uncalibrated.yaml");
++
++	ret = ipa_->init(IPASettings{ tuning, sensor_->model() }, sensorInfo,
++			 sensor_->controls(), lens ? lens->controls() : ControlInfoMap{},
++			 &controlInfo_);
++	if (ret) {
++		LOG(Camss, Error) << "Failed to initialise the IPA";
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
++/* The frame length goes first: the sensor bounds exposure by it. */
++void CamssCameraData::setSensorControls(const ControlList &sensorControls)
++{
++	ControlList frame(sensor_->controls());
++	ControlList rest(sensor_->controls());
++
++	for (const auto &[id, value] : sensorControls) {
++		if (id == V4L2_CID_VBLANK)
++			frame.set(id, value);
++		else
++			rest.set(id, value);
++	}
++
++	if (!frame.empty())
++		sensor_->setControls(&frame);
++	if (!rest.empty())
++		sensor_->setControls(&rest);
++}
++
++void CamssCameraData::setLensControls(const ControlList &lensControls)
++{
++	CameraLens *lens = sensor_->focusLens();
++	if (!lens || !lensControls.contains(V4L2_CID_FOCUS_ABSOLUTE))
++		return;
++
++	lens->setFocusPosition(lensControls.get(V4L2_CID_FOCUS_ABSOLUTE).get<int32_t>());
++}
++
++void CamssCameraData::setWbGains(uint32_t red, uint32_t blue)
++{
++	ControlList ctrls(pix_->controls());
++	ctrls.set(V4L2_CID_RED_BALANCE, static_cast<int32_t>(red));
++	ctrls.set(V4L2_CID_BLUE_BALANCE, static_cast<int32_t>(blue));
++	pix_->setControls(&ctrls);
++}
++
++void CamssCameraData::metadataReady(unsigned int frame, const ControlList &metadata)
++{
++	auto it = waiting_.find(frame);
++	if (it == waiting_.end())
++		return;
++
++	Request *request = it->second;
++	waiting_.erase(it);
++
++	request->_d()->metadata().merge(metadata);
++	pipe()->completeRequest(request);
++}
++
+ /*
+  * Enable this camera's links and disable every other enabled link into or
+  * out of the entities it uses, such as those another user left behind.
+@@ -457,6 +621,19 @@
+ 
+ 	cfg.setStream(&data->stream_);
+ 
++	ipa::camss::IPAConfigInfo ipaConfig;
++	ret = data->sensor_->sensorInfo(&ipaConfig.sensorInfo);
++	if (ret)
++		return ret;
++
++	ipaConfig.sensorControls = data->sensor_->controls();
++	if (CameraLens *lens = data->sensor_->focusLens())
++		ipaConfig.lensControls = lens->controls();
++
++	ret = data->ipa_->configure(ipaConfig);
++	if (ret)
++		return ret;
++
+ 	LOG(Camss, Info)
+ 		<< "Sensor " << format << ", scaled " << config->scaled_
+ 		<< ", crop " << crop << ", output " << cfg.toString();
+@@ -471,32 +648,24 @@
+ 							 buffers);
+ }
+ 
+-int PipelineHandlerCamss::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++int PipelineHandlerCamss::start(Camera *camera, const ControlList *controls)
+ {
+ 	CamssCameraData *data = cameraData(camera);
+ 
+-	/* Frame length for the default frame rate */
+-	IPACameraSensorInfo info;
+-	int ret = data->sensor_->sensorInfo(&info);
+-	if (ret)
+-		return ret;
+-
+-	unsigned int lines = info.pixelRate / (info.minLineLength * kDefaultFps);
+-	int32_t vblank = std::max<int32_t>(lines - info.outputSize.height, 0);
+-
+-	ControlList sensorControls(data->sensor_->controls());
+-	sensorControls.set(V4L2_CID_VBLANK, vblank);
+-	ret = data->sensor_->setControls(&sensorControls);
++	int ret = data->ipa_->start(controls ? *controls : ControlList{ controls::controls });
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = data->video_->importBuffers(data->stream_.configuration().bufferCount);
+-	if (ret)
++	if (ret) {
++		data->ipa_->stop();
+ 		return ret;
++	}
+ 
+ 	ret = data->video_->streamOn();
+ 	if (ret) {
+ 		data->video_->releaseBuffers();
++		data->ipa_->stop();
+ 		return ret;
+ 	}
+ 
+@@ -509,6 +678,12 @@
+ 
+ 	data->video_->streamOff();
+ 	data->video_->releaseBuffers();
++	data->ipa_->stop();
++
++	for (auto &[frame, request] : data->waiting_)
++		completeRequest(request);
++	data->waiting_.clear();
++	data->mappings_.clear();
+ }
+ 
+ int PipelineHandlerCamss::queueRequestDevice(Camera *camera, Request *request)
+@@ -519,18 +694,38 @@
+ 	if (!buffer)
+ 		return -ENOENT;
+ 
++	data->ipa_->queueRequest(request->sequence(), request->controls());
++
+ 	return data->video_->queueBuffer(buffer);
+ }
+ 
+ void PipelineHandlerCamss::bufferReady(FrameBuffer *buffer)
+ {
+ 	Request *request = buffer->request();
++	CamssCameraData *data = cameraData(request->_d()->camera());
+ 
+ 	request->_d()->metadata().set(controls::SensorTimestamp,
+ 				      buffer->metadata().timestamp);
+-
+ 	completeBuffer(request, buffer);
+-	completeRequest(request);
++
++	if (buffer->metadata().status != FrameMetadata::FrameSuccess) {
++		completeRequest(request);
++		return;
++	}
++
++	/* The IPA's metadata completes the request */
++	std::unique_ptr<MappedFrameBuffer> &map = data->mappings_[buffer];
++	if (!map)
++		map = std::make_unique<MappedFrameBuffer>(buffer, MappedFrameBuffer::MapFlag::Read);
++
++	const StreamConfiguration &cfg = data->stream_.configuration();
++	const auto &planes = map->planes();
++	const uint8_t *y = planes[0].data();
++	const uint8_t *uv = planes.size() > 1 ? planes[1].data() : y + cfg.stride * cfg.size.height;
++
++	data->waiting_[request->sequence()] = request;
++	data->ipa_->processStats(request->sequence(), frameStats(y, uv, cfg.size, cfg.stride),
++				 ControlList{});
+ }
+ 
+ bool PipelineHandlerCamss::match(DeviceEnumerator *enumerator)
