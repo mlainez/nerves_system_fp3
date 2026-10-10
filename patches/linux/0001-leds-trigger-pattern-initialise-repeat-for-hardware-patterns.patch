@@ -1,0 +1,30 @@
+From: Lars Wikman <lars@underjord.io>
+Date: Fri, 10 Oct 2026 15:10:00 +0200
+Subject: [PATCH] leds: trigger: pattern: initialise repeat for hardware patterns
+
+pattern_trig_activate() marks a fresh trigger as indefinite and makes
+the repeat attribute read -1, but leaves data->repeat itself at 0.
+Software patterns never look at repeat while is_indefinite is set, so
+nobody noticed. A hardware pattern, though, passes data->repeat straight
+to the driver's pattern_set(), and leds-qcom-lpg accepts only -1 and 1
+there: on a PMI632 every write to hw_pattern fails with EINVAL until
+userspace first writes the -1 to repeat that the attribute already
+claims to hold.
+
+Initialise repeat together with last_repeat.
+---
+ drivers/leds/trigger/ledtrig-pattern.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/leds/trigger/ledtrig-pattern.c b/drivers/leds/trigger/ledtrig-pattern.c
+--- a/drivers/leds/trigger/ledtrig-pattern.c
++++ b/drivers/leds/trigger/ledtrig-pattern.c
+@@ -478,7 +478,7 @@
+ 
+ 	data->type = PATTERN_TYPE_SW;
+ 	data->is_indefinite = true;
+-	data->last_repeat = -1;
++	data->last_repeat = data->repeat = -1;
+ 	mutex_init(&data->lock);
+ 	data->led_cdev = led_cdev;
+ 	led_set_trigger_data(led_cdev, data);

@@ -228,8 +228,13 @@ cannot open them; use `ffplay tcp://…`.
 
 **LEDs and vibrator.** The RGB notification LED and the two white flash
 LEDs are under `/sys/class/leds` (write `brightness`; the RGB LED also
-takes `multi_intensity`). The vibrator is a force-feedback input device;
-`rumble 300` vibrates for 300 ms.
+takes `multi_intensity`). The RGB LED can also play a pattern on its own:
+set `trigger` to `pattern` and write `hw_pattern` as steps of
+`brightness ms brightness 0`, all of the same length, such as
+`0 500 0 0 255 500 255 0` for a slow blink or a ramp of values for
+breathing. The PMIC steps through it from its own memory, so the pattern
+runs on through suspend to idle. The vibrator is a force-feedback input
+device; `rumble 300` vibrates for 300 ms.
 
 **Screen and touch.** The panel is a DRM device (`msm`) with fbdev
 emulation on `/dev/fb0`; the HX83112B touchscreen and the volume and

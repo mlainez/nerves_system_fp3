@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Patterns on the RGB notification LED, played by the PMIC: the kernel's
+  `pattern` LED trigger is built in, and a kernel patch gives it the
+  default repeat count it claims to have, which the PMI632 LPG driver
+  rejected, so `hw_pattern` now takes a blink or a breathing ramp. The
+  PMIC runs it from its SDAM through PBS, through suspend to idle and
+  with no help from the CPU.
+
 ## v0.3.0
 
 The cameras now run through the phone's camera image processor (the
