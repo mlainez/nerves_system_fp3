@@ -1,0 +1,327 @@
+firmware: qcom: add fairphone,fp3 to the qseecom allowlist and a raw userspace device
+
+The Fairphone 3 bootloader leaves the Keymaster trusted application
+resident in QSEE. Allow the qseecom device on this board and add
+/dev/qseecom_raw, an experimental shim over the qseecom app lookup and
+send calls, so that trusted application protocols can be explored from
+userspace.
+
+diff -Nur a/drivers/firmware/qcom/Kconfig b/drivers/firmware/qcom/Kconfig
+--- a/drivers/firmware/qcom/Kconfig	2026-10-10 11:25:35
++++ b/drivers/firmware/qcom/Kconfig	2026-10-10 11:25:35
+@@ -74,4 +74,14 @@
+ 	  Select Y here to provide access to EFI variables on the aforementioned
+ 	  platforms.
+ 
++config QCOM_QSEECOM_RAW
++	tristate "Qualcomm SEE raw userspace interface (experimental)"
++	depends on QCOM_QSEECOM
++	help
++	  Exposes /dev/qseecom_raw, which lets userspace look up a trusted
++	  application running in the Secure Execution Environment by name and
++	  exchange raw request/response buffers with it. Intended for
++	  exploring trusted application protocols; there is no listener or
++	  callback support.
++
+ endmenu
+diff -Nur a/drivers/firmware/qcom/Makefile b/drivers/firmware/qcom/Makefile
+--- a/drivers/firmware/qcom/Makefile	2026-10-10 11:25:35
++++ b/drivers/firmware/qcom/Makefile	2026-10-10 11:25:35
+@@ -8,3 +8,4 @@
+ obj-$(CONFIG_QCOM_TZMEM)	+= qcom_tzmem.o
+ obj-$(CONFIG_QCOM_QSEECOM)	+= qcom_qseecom.o
+ obj-$(CONFIG_QCOM_QSEECOM_UEFISECAPP) += qcom_qseecom_uefisecapp.o
++obj-$(CONFIG_QCOM_QSEECOM_RAW)	+= qcom_qseecom_raw.o
+diff -Nur a/drivers/firmware/qcom/qcom_qseecom_raw.c b/drivers/firmware/qcom/qcom_qseecom_raw.c
+--- a/drivers/firmware/qcom/qcom_qseecom_raw.c	1970-01-01 01:00:00
++++ b/drivers/firmware/qcom/qcom_qseecom_raw.c	2026-10-10 11:25:35
+@@ -0,0 +1,278 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Raw userspace access to QSEECOM trusted applications.
++ *
++ * This is a thin, experimental shim over qcom_scm_qseecom_app_get_id() and
++ * qcom_scm_qseecom_app_send() so that the request/response protocol of a
++ * trusted application can be explored from userspace without a kernel
++ * rebuild per iteration. It exposes /dev/qseecom_raw.
++ *
++ * A single write() carries one request:
++ *
++ *   struct qseecom_raw_hdr { __le32 name_len; __le32 rsp_len; }
++ *   char app_name[name_len];   application name, no NUL, at most 63 bytes
++ *   u8   req[];                the rest of the write is the request payload
++ *
++ * The application is looked up by name, the payload is copied into TZ
++ * memory and sent with its exact length; the response buffer is rsp_len
++ * bytes. A write with no payload only performs the lookup.
++ *
++ * The following read() returns the outcome once:
++ *
++ *   __le32 status;             0 on success, otherwise a negative errno
++ *   __le32 app_id;             the ID returned by the lookup (0 if it failed)
++ *   u8     rsp[rsp_len];       response buffer contents, even when status
++ *                              is non-zero, since the app may have written
++ *                              partial data before failing
++ *
++ * No listener/callback handling exists in the mainline transport, so any
++ * command that makes the application block on a listener fails with -EIO
++ * (and a WARN in qcom_scm.c). Only one request is in flight per open file.
++ */
++
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#include <linux/firmware/qcom/qcom_scm.h>
++#include <linux/firmware/qcom/qcom_tzmem.h>
++
++#define QSEECOM_RAW_MAX_NAME	63
++#define QSEECOM_RAW_MAX_BUF	SZ_64K
++#define QSEECOM_RAW_ALIGN	64
++
++struct qseecom_raw_hdr {
++	__le32 name_len;
++	__le32 rsp_len;
++} __packed;
++
++struct qseecom_raw_result {
++	__le32 status;
++	__le32 app_id;
++	u8 rsp[];
++} __packed;
++
++struct qseecom_raw_file {
++	struct mutex lock;
++	struct qseecom_raw_result *result;
++	size_t result_len;
++	bool pending;
++};
++
++static DEFINE_MUTEX(qseecom_raw_pool_lock);
++static struct qcom_tzmem_pool *qseecom_raw_pool;
++
++static struct qcom_tzmem_pool *qseecom_raw_get_pool(void)
++{
++	struct qcom_tzmem_pool_config cfg = {
++		.initial_size = SZ_16K,
++		.policy = QCOM_TZMEM_POLICY_ON_DEMAND,
++		.max_size = SZ_512K,
++	};
++	struct qcom_tzmem_pool *pool;
++
++	guard(mutex)(&qseecom_raw_pool_lock);
++
++	if (!qseecom_raw_pool) {
++		pool = qcom_tzmem_pool_new(&cfg);
++		if (IS_ERR(pool))
++			return pool;
++		qseecom_raw_pool = pool;
++	}
++
++	return qseecom_raw_pool;
++}
++
++static int qseecom_raw_open(struct inode *inode, struct file *filp)
++{
++	struct qseecom_raw_file *f;
++
++	f = kzalloc(sizeof(*f), GFP_KERNEL);
++	if (!f)
++		return -ENOMEM;
++
++	mutex_init(&f->lock);
++	filp->private_data = f;
++
++	return stream_open(inode, filp);
++}
++
++static int qseecom_raw_release(struct inode *inode, struct file *filp)
++{
++	struct qseecom_raw_file *f = filp->private_data;
++
++	kfree(f->result);
++	kfree(f);
++
++	return 0;
++}
++
++static ssize_t qseecom_raw_write(struct file *filp, const char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct qseecom_raw_file *f = filp->private_data;
++	struct qseecom_raw_hdr hdr;
++	struct qseecom_raw_result *res;
++	struct qcom_tzmem_pool *pool;
++	char name[QSEECOM_RAW_MAX_NAME + 1];
++	size_t name_len, req_len, rsp_len, res_len;
++	void *req = NULL, *rsp = NULL;
++	u32 app_id = 0;
++	int status;
++
++	if (count < sizeof(hdr))
++		return -EINVAL;
++	if (copy_from_user(&hdr, ubuf, sizeof(hdr)))
++		return -EFAULT;
++
++	name_len = le32_to_cpu(hdr.name_len);
++	rsp_len = le32_to_cpu(hdr.rsp_len);
++
++	if (name_len == 0 || name_len > QSEECOM_RAW_MAX_NAME)
++		return -EINVAL;
++	if (rsp_len > QSEECOM_RAW_MAX_BUF)
++		return -EINVAL;
++	if (count < sizeof(hdr) + name_len)
++		return -EINVAL;
++
++	req_len = count - sizeof(hdr) - name_len;
++	if (req_len > QSEECOM_RAW_MAX_BUF)
++		return -EINVAL;
++	if (req_len && rsp_len == 0)
++		return -EINVAL;
++
++	if (copy_from_user(name, ubuf + sizeof(hdr), name_len))
++		return -EFAULT;
++	name[name_len] = '\0';
++
++	if (!qcom_scm_is_available())
++		return -ENODEV;
++
++	pool = qseecom_raw_get_pool();
++	if (IS_ERR(pool))
++		return PTR_ERR(pool);
++
++	res_len = sizeof(*res) + (req_len ? rsp_len : 0);
++	res = kzalloc(res_len, GFP_KERNEL);
++	if (!res)
++		return -ENOMEM;
++
++	status = qcom_scm_qseecom_app_get_id(name, &app_id);
++	pr_info("qseecom_raw: lookup \"%s\" -> id %u (%d)\n", name, app_id, status);
++
++	if (!status && req_len) {
++		req = qcom_tzmem_alloc(pool, ALIGN(req_len, QSEECOM_RAW_ALIGN),
++				       GFP_KERNEL);
++		rsp = qcom_tzmem_alloc(pool, ALIGN(rsp_len, QSEECOM_RAW_ALIGN),
++				       GFP_KERNEL);
++		if (!req || !rsp) {
++			status = -ENOMEM;
++			goto out;
++		}
++
++		memset(req, 0, ALIGN(req_len, QSEECOM_RAW_ALIGN));
++		memset(rsp, 0, ALIGN(rsp_len, QSEECOM_RAW_ALIGN));
++
++		if (copy_from_user(req, ubuf + sizeof(hdr) + name_len, req_len)) {
++			status = -EFAULT;
++			goto out;
++		}
++
++		status = qcom_scm_qseecom_app_send(app_id, req, req_len,
++						   rsp, rsp_len);
++		pr_info("qseecom_raw: send to %u, req %zu rsp %zu -> %d\n",
++			app_id, req_len, rsp_len, status);
++
++		memcpy(res->rsp, rsp, rsp_len);
++	}
++
++out:
++	if (req)
++		qcom_tzmem_free(req);
++	if (rsp)
++		qcom_tzmem_free(rsp);
++
++	if (status == -ENOMEM || status == -EFAULT) {
++		kfree(res);
++		return status;
++	}
++
++	res->status = cpu_to_le32((u32)status);
++	res->app_id = cpu_to_le32(app_id);
++
++	mutex_lock(&f->lock);
++	kfree(f->result);
++	f->result = res;
++	f->result_len = res_len;
++	f->pending = true;
++	mutex_unlock(&f->lock);
++
++	return count;
++}
++
++static ssize_t qseecom_raw_read(struct file *filp, char __user *ubuf,
++				size_t count, loff_t *ppos)
++{
++	struct qseecom_raw_file *f = filp->private_data;
++	ssize_t n = 0;
++
++	mutex_lock(&f->lock);
++
++	if (!f->pending)
++		goto out;
++
++	n = min(count, f->result_len);
++	if (copy_to_user(ubuf, f->result, n)) {
++		n = -EFAULT;
++		goto out;
++	}
++
++	f->pending = false;
++
++out:
++	mutex_unlock(&f->lock);
++	return n;
++}
++
++static const struct file_operations qseecom_raw_fops = {
++	.owner = THIS_MODULE,
++	.open = qseecom_raw_open,
++	.release = qseecom_raw_release,
++	.read = qseecom_raw_read,
++	.write = qseecom_raw_write,
++};
++
++static struct miscdevice qseecom_raw_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "qseecom_raw",
++	.fops = &qseecom_raw_fops,
++	.mode = 0600,
++};
++
++static int __init qseecom_raw_init(void)
++{
++	return misc_register(&qseecom_raw_misc);
++}
++
++static void __exit qseecom_raw_exit(void)
++{
++	misc_deregister(&qseecom_raw_misc);
++
++	mutex_lock(&qseecom_raw_pool_lock);
++	if (qseecom_raw_pool)
++		qcom_tzmem_pool_free(qseecom_raw_pool);
++	qseecom_raw_pool = NULL;
++	mutex_unlock(&qseecom_raw_pool_lock);
++}
++
++module_init(qseecom_raw_init);
++module_exit(qseecom_raw_exit);
++
++MODULE_DESCRIPTION("Raw userspace interface to QSEECOM trusted applications");
++MODULE_LICENSE("GPL");
+diff -Nur a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
+--- a/drivers/firmware/qcom/qcom_scm.c	2026-10-10 11:25:35
++++ b/drivers/firmware/qcom/qcom_scm.c	2026-10-10 11:25:35
+@@ -1997,6 +1997,7 @@
+ 	{ .compatible = "dell,inspiron-14-plus-7441" },
+ 	{ .compatible = "dell,latitude-7455" },
+ 	{ .compatible = "dell,xps13-9345" },
++	{ .compatible = "fairphone,fp3" },
+ 	{ .compatible = "hp,elitebook-ultra-g1q" },
+ 	{ .compatible = "hp,omnibook-x14" },
+ 	{ .compatible = "huawei,gaokun3" },
