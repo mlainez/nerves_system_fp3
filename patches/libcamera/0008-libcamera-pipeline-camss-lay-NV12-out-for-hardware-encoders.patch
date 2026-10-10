@@ -1,0 +1,139 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: pipeline: camss: lay NV12 out for hardware encoders
+
+Hardware encoders such as Qualcomm's Venus read NV12 with the chroma
+plane at a luma height rounded up to 32 lines, from a buffer with some
+slack at the end. A camss.nv12_plane_alignment option has the VFE write
+the frame padded that way, so such an encoder imports the camera's
+buffers instead of copying every frame. A 4K stream at 30 fps then
+takes a third of the CPU.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ruN a/src/libcamera/pipeline/camss/camss.cpp b/src/libcamera/pipeline/camss/camss.cpp
+--- a/src/libcamera/pipeline/camss/camss.cpp
++++ b/src/libcamera/pipeline/camss/camss.cpp
+@@ -43,6 +43,7 @@
+ #include "libcamera/internal/ipa_manager.h"
+ #include "libcamera/internal/mapped_framebuffer.h"
+ #include "libcamera/internal/device_enumerator.h"
++#include "libcamera/internal/global_configuration.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+ #include "libcamera/internal/request.h"
+@@ -66,6 +67,9 @@
+ 
+ constexpr unsigned int kBufferCount = 4;
+ 
++/* Bytes past the chroma plane that hardware encoders read buffers up to */
++constexpr unsigned int kEncoderSlack = 16384;
++
+ /* Statistics grid and histogram the IPA works from */
+ constexpr unsigned int kStatsColumns = 64;
+ constexpr unsigned int kStatsRows = 48;
+@@ -192,6 +196,9 @@
+ 
+ 	/* Output buffers mapped for the statistics, by buffer */
+ 	std::map<const FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> mappings_;
++
++	/* Lines the NV12 luma plane is padded to, see validate() */
++	unsigned int planeAlignment_ = 1;
+ };
+ 
+ class CamssCameraConfiguration : public CameraConfiguration
+@@ -207,6 +214,7 @@
+ 	/* Chosen by validate() */
+ 	V4L2SubdeviceFormat sensorFormat_;
+ 	Size scaled_;
++	Size output_;
+ 
+ private:
+ 	const CamssCameraData *data_;
+@@ -482,14 +490,28 @@
+ 	if (mode == modes.end())
+ 		return Invalid;
+ 
++	/*
++	 * Hardware encoders such as Venus read NV12 with the chroma plane at a
++	 * luma height rounded up to a multiple of lines, from a buffer with some
++	 * slack at the end. With camss.nv12_plane_alignment set, the VFE writes
++	 * the luma height rounded up to a multiple of that many lines, the
++	 * extra ones below the frame, into such a buffer, so an encoder imports
++	 * it instead of copying each frame. A sensor mode with no lines to
++	 * spare below the frame keeps the frame unpadded.
++	 */
++	const PixelFormatInfo &info = PixelFormatInfo::info(cfg.pixelFormat);
++	Size padded(size.width, utils::alignUp(size.height, data_->planeAlignment_));
++	bool pad = data_->planeAlignment_ > 1 && padded.height <= mode->height;
++	output_ = pad ? padded : size;
++
+ 	sensorFormat_ = {};
+ 	sensorFormat_.code = kBayerCodes[0];
+ 	sensorFormat_.size = *mode;
+-	scaled_ = scaledMode(*mode, size);
++	scaled_ = scaledMode(*mode, output_);
+ 
+-	const PixelFormatInfo &info = PixelFormatInfo::info(cfg.pixelFormat);
+ 	cfg.stride = info.stride(size.width, 0, 1);
+-	cfg.frameSize = info.frameSize(size, 1);
++	cfg.frameSize = pad ? utils::alignUp(info.frameSize(output_, 1) + kEncoderSlack, 4096)
++			    : info.frameSize(size, 1);
+ 	cfg.bufferCount = std::max(cfg.bufferCount, kBufferCount);
+ 
+ 	/* The VFE converts to full range BT.601 */
+@@ -593,28 +615,31 @@
+ 		return ret;
+ 
+ 	const Size &scaled = config->scaled_;
+-	Rectangle crop((scaled.width - cfg.size.width) / 2 & ~1,
+-		       (scaled.height - cfg.size.height) / 2 & ~1, cfg.size);
++	const Size &output = config->output_;
++	Rectangle crop((scaled.width - output.width) / 2 & ~1,
++		       (scaled.height - output.height) / 2 & ~1, output);
+ 	ret = data->pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop);
+ 	if (ret)
+ 		return ret;
+ 
+ 	V4L2SubdeviceFormat out{};
+ 	out.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+-	out.size = cfg.size;
++	out.size = output;
+ 	ret = data->pix_->setFormat(1, &out);
+ 	if (ret)
+ 		return ret;
+ 
+ 	V4L2DeviceFormat videoFormat{};
+ 	videoFormat.fourcc = data->video_->toV4L2PixelFormat(cfg.pixelFormat);
+-	videoFormat.size = cfg.size;
++	videoFormat.size = output;
+ 	videoFormat.planesCount = 1;
++	videoFormat.planes[0].bpl = cfg.stride;
++	videoFormat.planes[0].size = cfg.frameSize;
+ 	ret = data->video_->setFormat(&videoFormat);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (videoFormat.size != cfg.size) {
++	if (videoFormat.size != output || videoFormat.planes[0].size < cfg.frameSize) {
+ 		LOG(Camss, Error) << "Video node took " << videoFormat.size;
+ 		return -EINVAL;
+ 	}
+@@ -737,6 +762,10 @@
+ 	if (!media_)
+ 		return false;
+ 
++	const GlobalConfiguration &configuration = cameraManager()->_d()->configuration();
++	unsigned int planeAlignment = std::max(configuration.option<unsigned int>(
++		{ "camss", "nv12_plane_alignment" }).value_or(1), 1u);
++
+ 	unsigned int index = 0;
+ 
+ 	for (MediaEntity *entity : media_->entities()) {
+@@ -751,6 +780,7 @@
+ 		}
+ 
+ 		auto data = std::make_unique<CamssCameraData>(this, index);
++		data->planeAlignment_ = planeAlignment;
+ 		int ret = data->init(media_.get(), entity);
+ 		if (ret) {
+ 			LOG(Camss, Warning)
