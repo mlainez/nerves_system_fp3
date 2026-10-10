@@ -1,0 +1,150 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: camss: take the Fairphone 3 sensors
+
+The camss pipeline handler only took GRBG sensors, the order of the
+Fairphone 3+ ones. It now takes the 10-bit Bayer order its sensor
+offers, so the Fairphone 3's RGGB IMX363 and GRBG S5K4H7YX stream too.
+Add their analogue gain helpers and the IPA tuning that starts white
+balance from their D50 grey references.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ruN a/src/ipa/camss/data/imx363.yaml b/src/ipa/camss/data/imx363.yaml
+--- a/src/ipa/camss/data/imx363.yaml
++++ b/src/ipa/camss/data/imx363.yaml
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++# Sony IMX363: white balance starts from its D50 grey reference
++awb:
++  initialRed: 2.29
++  initialBlue: 1.60
++...
+diff -ruN a/src/ipa/camss/data/meson.build b/src/ipa/camss/data/meson.build
+--- a/src/ipa/camss/data/meson.build
++++ b/src/ipa/camss/data/meson.build
+@@ -1,7 +1,9 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'imx363.yaml',
+     's5k3p9sp.yaml',
++    's5k4h7yx.yaml',
+     's5kgm1sp.yaml',
+     'uncalibrated.yaml',
+ ])
+diff -ruN a/src/ipa/camss/data/s5k4h7yx.yaml b/src/ipa/camss/data/s5k4h7yx.yaml
+--- a/src/ipa/camss/data/s5k4h7yx.yaml
++++ b/src/ipa/camss/data/s5k4h7yx.yaml
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++# Samsung S5K4H7YX: white balance starts from its D50 grey reference
++awb:
++  initialRed: 1.85
++  initialBlue: 1.56
++...
+diff -ruN a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -576,6 +576,28 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("s5k3p9sp", CameraSensorHelperS5k3p9sp)
+ 
++class CameraSensorHelperS5k4h7yx : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k4h7yx()
++	{
++		/* Analogue gain code 32 is 1x */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k4h7yx", CameraSensorHelperS5k4h7yx)
++
++class CameraSensorHelperImx363 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx363()
++	{
++		/* SMIA gain: 512 / (512 - code) */
++		gain_ = AnalogueGainLinear{ 0, 512, -1, 512 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx363", CameraSensorHelperImx363)
++
+ class CameraSensorHelperImx258 : public CameraSensorHelper
+ {
+ public:
+diff -ruN a/src/libcamera/pipeline/camss/camss.cpp b/src/libcamera/pipeline/camss/camss.cpp
+--- a/src/libcamera/pipeline/camss/camss.cpp
++++ b/src/libcamera/pipeline/camss/camss.cpp
+@@ -76,7 +76,10 @@
+ constexpr unsigned int kHistogramBins = 64;
+ 
+ /* Bayer orders the pixel path debayers */
+-const std::array<unsigned int, 1> kBayerCodes = { MEDIA_BUS_FMT_SGRBG10_1X10 };
++const std::array<unsigned int, 4> kBayerCodes = {
++	MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10,
++	MEDIA_BUS_FMT_SBGGR10_1X10, MEDIA_BUS_FMT_SGBRG10_1X10,
++};
+ 
+ /*
+  * The part of a sensor mode with the output's aspect ratio, scaled down so
+@@ -173,6 +176,7 @@
+ 	void metadataReady(unsigned int frame, const ControlList &metadata);
+ 
+ 	/* The sensor modes the pixel path takes, smallest first */
++	unsigned int bayerCode() const;
+ 	std::vector<Size> modes() const;
+ 
+ 	unsigned int index_;
+@@ -424,15 +428,30 @@
+ 	return 0;
+ }
+ 
++/* The sensor's 10-bit Bayer code, 0 when it has none the pixel path takes */
++unsigned int CamssCameraData::bayerCode() const
++{
++	const std::vector<unsigned int> codes = sensor_->mbusCodes();
++
++	for (unsigned int code : kBayerCodes) {
++		if (std::find(codes.begin(), codes.end(), code) != codes.end())
++			return code;
++	}
++
++	return 0;
++}
++
+ std::vector<Size> CamssCameraData::modes() const
+ {
+ 	std::vector<Size> modes;
++	unsigned int code = bayerCode();
+ 
+-	for (unsigned int code : kBayerCodes) {
+-		for (const Size &size : sensor_->sizes(code)) {
+-			if (size.width <= kMaxInputWidth)
+-				modes.push_back(size);
+-		}
++	if (!code)
++		return modes;
++
++	for (const Size &size : sensor_->sizes(code)) {
++		if (size.width <= kMaxInputWidth)
++			modes.push_back(size);
+ 	}
+ 
+ 	std::sort(modes.begin(), modes.end(),
+@@ -505,7 +524,7 @@
+ 	output_ = pad ? padded : size;
+ 
+ 	sensorFormat_ = {};
+-	sensorFormat_.code = kBayerCodes[0];
++	sensorFormat_.code = data_->bayerCode();
+ 	sensorFormat_.size = *mode;
+ 	scaled_ = scaledMode(*mode, output_);
+ 
