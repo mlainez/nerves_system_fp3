@@ -1,0 +1,226 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: simple: honour FrameDurationLimits
+
+The simple pipeline leaves the sensor at its mode's default frame
+length, whatever frame rate is asked for. A binned mode that runs at
+90 fps then has every frame debayered for a 30 fps stream, and auto
+exposure is capped at 11 ms.
+
+Pass the start controls and the configured sensor timing to the soft
+IPA, which turns the longest allowed frame duration into a vertical
+blanking value for the configured mode and caps its exposure at the
+resulting frame length. VBLANK goes through the delayed controls, ahead
+of the exposure it allows.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ru a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+--- a/include/libcamera/internal/software_isp/software_isp.h	2026-10-10 05:19:07.374320988 +0200
++++ b/include/libcamera/internal/software_isp/software_isp.h	2026-10-10 05:19:21.146743167 +0200
+@@ -73,7 +73,7 @@
+ 	void processStats(const uint32_t frame, const uint32_t bufferId,
+ 			  const ControlList &sensorControls);
+ 
+-	int start();
++	int start(const ControlList &controls);
+ 	void stop();
+ 
+ 	void queueRequest(const uint32_t frame, const ControlList &controls);
+diff -ru a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+--- a/include/libcamera/ipa/soft.mojom	2026-10-10 05:19:07.369561730 +0200
++++ b/include/libcamera/ipa/soft.mojom	2026-10-10 05:19:21.146709307 +0200
+@@ -9,6 +9,7 @@
+ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
++	libcamera.IPACameraSensorInfo sensorInfo;
+ 	libcamera.ControlInfoMap sensorControls;
+ };
+ 
+@@ -19,7 +20,7 @@
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+-	start() => (int32 ret);
++	start(libcamera.ControlList controls) => (int32 ret);
+ 	stop();
+ 	configure(IPAConfigInfo configInfo)
+ 		=> (int32 ret);
+diff -ru a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+--- a/src/ipa/simple/ipa_context.h	2026-10-10 05:19:07.392752884 +0200
++++ b/src/ipa/simple/ipa_context.h	2026-10-10 05:19:21.147288296 +0200
+@@ -33,6 +33,13 @@
+ 	struct {
+ 		std::optional<uint8_t> level;
+ 	} black;
++	struct {
++		/* Without a value the sensor's frame length is fixed */
++		std::optional<int32_t> vblank;
++		int32_t vblankMin, vblankMax;
++		/* Lines between the frame length and the longest exposure */
++		int32_t exposureMargin;
++	} frame;
+ };
+ 
+ struct IPAActiveState {
+diff -ru a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+--- a/src/ipa/simple/soft_simple.cpp	2026-10-10 05:19:07.388144745 +0200
++++ b/src/ipa/simple/soft_simple.cpp	2026-10-10 05:20:00.639548282 +0200
+@@ -5,6 +5,7 @@
+  * Simple Software Image Processing Algorithm module
+  */
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <stdint.h>
+ #include <sys/mman.h>
+@@ -60,7 +61,7 @@
+ 		 bool *ccmEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+ 
+-	int start() override;
++	int start(const ControlList &controls) override;
+ 	void stop() override;
+ 
+ 	void queueRequest(const uint32_t frame, const ControlList &controls) override;
+@@ -177,6 +178,15 @@
+ 		stats_ = static_cast<SwIspStats *>(mem);
+ 	}
+ 
++	/*
++	 * The frame durations a sensor reaches depend on the mode configured
++	 * later, so advertise a wide range and clamp the duration to the mode
++	 * in start().
++	 */
++	if (sensorControls.find(V4L2_CID_VBLANK) != sensorControls.end())
++		context_.ctrlMap[&controls::FrameDurationLimits] =
++			ControlInfo(int64_t{ 1000 }, int64_t{ 1000000 }, int64_t{ 33333 });
++
+ 	ControlInfoMap::Map ctrlMap = context_.ctrlMap;
+ 	*ipaControls = ControlInfoMap(std::move(ctrlMap), controls::controls);
+ 
+@@ -202,6 +212,7 @@
+ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ {
+ 	sensorInfoMap_ = configInfo.sensorControls;
++	context_.sensorInfo = configInfo.sensorInfo;
+ 
+ 	const ControlInfo &exposureInfo = sensorInfoMap_.find(V4L2_CID_EXPOSURE)->second;
+ 	const ControlInfo &gainInfo = sensorInfoMap_.find(V4L2_CID_ANALOGUE_GAIN)->second;
+@@ -220,6 +231,20 @@
+ 		context_.configuration.agc.exposureMin = 1;
+ 	}
+ 
++	auto vblankInfo = sensorInfoMap_.find(V4L2_CID_VBLANK);
++	if (vblankInfo != sensorInfoMap_.end()) {
++		auto &frame = context_.configuration.frame;
++		int32_t height = context_.sensorInfo.outputSize.height;
++
++		frame.vblank = vblankInfo->second.def().get<int32_t>();
++		frame.vblankMin = vblankInfo->second.min().get<int32_t>();
++		frame.vblankMax = vblankInfo->second.max().get<int32_t>();
++		frame.exposureMargin = std::max(height + *frame.vblank -
++						context_.configuration.agc.exposureMax, 0);
++		context_.configuration.agc.exposureMax =
++			height + *frame.vblank - frame.exposureMargin;
++	}
++
+ 	int32_t againMin = gainInfo.min().get<int32_t>();
+ 	int32_t againMax = gainInfo.max().get<int32_t>();
+ 	int32_t againDef = gainInfo.def().get<int32_t>();
+@@ -265,8 +290,34 @@
+ 	return 0;
+ }
+ 
+-int IPASoftSimple::start()
++int IPASoftSimple::start(const ControlList &controls)
+ {
++	auto &frame = context_.configuration.frame;
++	auto &agc = context_.configuration.agc;
++	int32_t height = context_.sensorInfo.outputSize.height;
++
++	if (!frame.vblank)
++		return 0;
++
++	/* The longest duration allowed, which leaves the most exposure time */
++	const auto &limits = controls.get(controls::FrameDurationLimits);
++	if (limits) {
++		int32_t lines = (*limits)[1] * 1.0us / agc.lineDuration;
++		frame.vblank = std::clamp(lines - height, frame.vblankMin,
++					  frame.vblankMax);
++	}
++
++	agc.exposureMax = std::max(height + *frame.vblank - frame.exposureMargin,
++				   agc.exposureMin);
++
++	ControlList ctrls(sensorInfoMap_);
++	ctrls.set(V4L2_CID_VBLANK, *frame.vblank);
++	setSensorControls.emit(ctrls);
++
++	LOG(IPASoft, Debug)
++		<< "Frame length " << height + *frame.vblank << " lines, exposure "
++		<< agc.exposureMin << "-" << agc.exposureMax;
++
+ 	return 0;
+ }
+ 
+diff -ru a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+--- a/src/libcamera/pipeline/simple/simple.cpp	2026-10-10 05:19:07.383454176 +0200
++++ b/src/libcamera/pipeline/simple/simple.cpp	2026-10-10 05:20:15.970628279 +0200
+@@ -570,6 +570,9 @@
+ 		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+ 		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+ 	};
++	/* The frame length must be set before the exposure it allows */
++	if (sensor_->controls().count(V4L2_CID_VBLANK))
++		params[V4L2_CID_VBLANK] = { delays.vblankDelay, true };
+ 	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
+ 
+ 	LOG(SimplePipeline, Debug)
+@@ -1593,6 +1596,9 @@
+ 	} else {
+ 		ipa::soft::IPAConfigInfo configInfo;
+ 		configInfo.sensorControls = data->sensor_->controls();
++		ret = data->sensor_->sensorInfo(&configInfo.sensorInfo);
++		if (ret)
++			return ret;
+ 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
+ 	}
+ }
+@@ -1615,7 +1621,7 @@
+ 		return data->video_->exportBuffers(count, buffers);
+ }
+ 
+-int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ {
+ 	SimpleCameraData *data = cameraData(camera);
+ 	V4L2VideoDevice *video = data->video_;
+@@ -1673,7 +1679,8 @@
+ 		if (data->converter_)
+ 			ret = data->converter_->start();
+ 		else if (data->swIsp_)
+-			ret = data->swIsp_->start();
++			ret = data->swIsp_->start(controls ? *controls
++							   : ControlList(controls::controls));
+ 		else
+ 			ret = 0;
+ 
+diff -ru a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+--- a/src/libcamera/software_isp/software_isp.cpp	2026-10-10 05:19:07.378943057 +0200
++++ b/src/libcamera/software_isp/software_isp.cpp	2026-10-10 05:19:21.146799687 +0200
+@@ -352,11 +352,12 @@
+ 
+ /**
+  * \brief Starts the Software ISP streaming operation
++ * \param[in] controls The controls the camera is started with
+  * \return 0 on success, any other value indicates an error
+  */
+-int SoftwareIsp::start()
++int SoftwareIsp::start(const ControlList &controls)
+ {
+-	int ret = ipa_->start();
++	int ret = ipa_->start(controls);
+ 	if (ret)
+ 		return ret;
+ 
