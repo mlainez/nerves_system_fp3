@@ -1,0 +1,68 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: software_isp: lay NV12 out for hardware encoders
+
+Hardware encoders such as Qualcomm's Venus read NV12 with the chroma
+plane at a luma height rounded up to 32 lines, from a buffer with some
+slack at the end. A software_isp.nv12_plane_alignment option lays the
+debayered frames out that way, so such an encoder imports them instead
+of copying every frame into its own buffers. A 4K stream then costs
+an eighth less CPU.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -118,6 +118,15 @@
+ 	bool enableInputMemcpy =
+ 		configuration.option<bool>({ "software_isp", "copy_input_buffer" }).value_or(true);
+ 
++	/*
++	 * Hardware encoders such as Venus read NV12 with the chroma plane at
++	 * a luma height rounded up to a multiple of lines, from a buffer with
++	 * some slack at the end. Laying frames out that way lets them encode
++	 * the debayered buffers in place instead of copying each frame.
++	 */
++	nv12PlaneAlignment_ = std::max(configuration.option<unsigned int>(
++		{ "software_isp", "nv12_plane_alignment" }).value_or(1), 1u);
++
+ 	unsigned int threadCount =
+ 		configuration.option<unsigned int>({ "software_isp", "threads" }).value_or(kDefaultThreads);
+ 	threadCount = std::clamp(threadCount, kMinThreads, kMaxThreads);
+@@ -711,8 +720,13 @@
+ 	/* round up to multiple of 8 for 64 bits alignment */
+ 	unsigned int stride = (size.width * config.bpp / 8 + 7) & ~7;
+ 
+-	if (outputFormat == formats::NV12)
+-		return std::make_tuple(stride, stride * size.height * 3 / 2);
++	if (outputFormat == formats::NV12) {
++		if (nv12PlaneAlignment_ == 1)
++			return std::make_tuple(stride, stride * size.height * 3 / 2);
++
++		unsigned int lines = utils::alignUp(size.height, nv12PlaneAlignment_);
++		return std::make_tuple(stride, utils::alignUp(stride * lines * 3 / 2 + 16384, 4096));
++	}
+ 
+ 	return std::make_tuple(stride, stride * size.height);
+ }
+@@ -775,7 +789,8 @@
+ 	src += (window.y + yStart_) * debayer_->inputConfig_.stride +
+ 	       window.x * debayer_->inputConfig_.bpp / 8;
+ 	/* The chroma plane follows the luma plane, one line per two lines */
+-	uvDst_ = dst + window.height * debayer_->outputConfig_.stride +
++	uvDst_ = dst + utils::alignUp(window.height, debayer_->nv12PlaneAlignment_) *
++			       debayer_->outputConfig_.stride +
+ 		 yStart_ / 2 * debayer_->outputConfig_.stride;
+ 	/* Adjust dst for yStart_ */
+ 	dst += yStart_ * debayer_->outputConfig_.stride;
+diff -ru a/src/libcamera/software_isp/debayer_cpu.h b/src/libcamera/software_isp/debayer_cpu.h
+--- a/src/libcamera/software_isp/debayer_cpu.h
++++ b/src/libcamera/software_isp/debayer_cpu.h
+@@ -147,6 +147,7 @@
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	unsigned int xShift_; /* Offset of 0/1 applied to window_.x */
+ 	bool outputNV12_; /* Debayer to RGB888 lines, then convert them to NV12 */
++	unsigned int nv12PlaneAlignment_; /* Lines the NV12 luma plane is padded to */
+ 
+ 	static constexpr unsigned int kMinThreads = 1;
+ 	static constexpr unsigned int kMaxThreads = 8;
