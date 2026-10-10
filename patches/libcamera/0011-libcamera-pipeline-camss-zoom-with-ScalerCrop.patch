@@ -1,0 +1,289 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: pipeline: camss: zoom with ScalerCrop
+
+The camss handler takes the ScalerCrop control: the VFE shows the part
+of the pixel array it covers, fitted to the output's aspect ratio, by
+scaling the sensor mode down further and cropping the output out of it.
+The VFE doesn't scale up, so zoom stops where that part shrinks to the
+output's size. Its crop can't change while it streams, so streaming
+starts with the first request, which carries the ScalerCrop of
+applications such as libcamerasrc. A sensor configuration picks the
+sensor mode, so an application can run the largest one to zoom into.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ruN a/src/libcamera/pipeline/camss/camss.cpp b/src/libcamera/pipeline/camss/camss.cpp
+--- a/src/libcamera/pipeline/camss/camss.cpp
++++ b/src/libcamera/pipeline/camss/camss.cpp
+@@ -29,6 +29,7 @@
+ #include <libcamera/camera_manager.h>
+ #include <libcamera/color_space.h>
+ #include <libcamera/control_ids.h>
++#include <libcamera/property_ids.h>
+ #include <libcamera/formats.h>
+ #include <libcamera/geometry.h>
+ #include <libcamera/ipa/camss_ipa_interface.h>
+@@ -81,21 +82,6 @@
+ 	MEDIA_BUS_FMT_SBGGR10_1X10, MEDIA_BUS_FMT_SGBRG10_1X10,
+ };
+ 
+-/*
+- * The part of a sensor mode with the output's aspect ratio, scaled down so
+- * the output crops out of its full width or height.
+- */
+-Size scaledMode(const Size &mode, const Size &out)
+-{
+-	double ratio = std::max(static_cast<double>(out.width) / mode.width,
+-				static_cast<double>(out.height) / mode.height);
+-
+-	Size scaled(std::ceil(mode.width * ratio), std::ceil(mode.height * ratio));
+-	scaled.alignUpTo(2, 2);
+-
+-	return scaled.boundedTo(mode);
+-}
+-
+ /* Linear light of an 8-bit value encoded with the VFE gamma 2.2 curve */
+ float linear(int value)
+ {
+@@ -174,6 +160,7 @@
+ 	void setLensControls(const ControlList &lensControls);
+ 	void setWbGains(uint32_t red, uint32_t blue);
+ 	void metadataReady(unsigned int frame, const ControlList &metadata);
++	int applyCrop(const Rectangle &scalerCrop);
+ 
+ 	/* The sensor modes the pixel path takes, smallest first */
+ 	unsigned int bayerCode() const;
+@@ -203,6 +190,17 @@
+ 
+ 	/* Lines the NV12 luma plane is padded to, see validate() */
+ 	unsigned int planeAlignment_ = 1;
++
++	/* The configured sensor mode, the pixel array area it covers, the VFE output */
++	Size mode_;
++	Rectangle analogCrop_;
++	Size output_;
++
++	/* The applied ScalerCrop, in pixel array coordinates */
++	Rectangle scalerCrop_;
++
++	/* The video node streams from the first request on, see start() */
++	bool streaming_ = false;
+ };
+ 
+ class CamssCameraConfiguration : public CameraConfiguration
+@@ -217,7 +215,6 @@
+ 
+ 	/* Chosen by validate() */
+ 	V4L2SubdeviceFormat sensorFormat_;
+-	Size scaled_;
+ 	Size output_;
+ 
+ private:
+@@ -346,6 +343,65 @@
+ 		return ret;
+ 	}
+ 
++	/* ScalerCrop zooms into the pixel array, see applyCrop() */
++	const Rectangle &array = sensorInfo.analogCrop;
++	properties_.set(properties::ScalerCropMaximum, array);
++
++	ControlInfoMap::Map ctrls(controlInfo_.begin(), controlInfo_.end());
++	ctrls[&controls::ScalerCrop] =
++		ControlInfo(Rectangle(array.x, array.y, 1, 1), array, array);
++	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
++
++	return 0;
++}
++
++/*
++ * Zoom into the part of the pixel array that scalerCrop covers. The part
++ * of the sensor mode it maps to, fitted to the output's aspect ratio
++ * around its centre, is what the output shows. The VFE only scales down,
++ * so that part keeps at least the output's size: the VFE scales the whole
++ * mode so that part lands on the output, then crops the output out of it.
++ */
++int CamssCameraData::applyCrop(const Rectangle &scalerCrop)
++{
++	Rectangle area = scalerCrop.boundedTo(analogCrop_);
++	if (area.isNull())
++		area = analogCrop_;
++
++	area = area.translatedBy(-analogCrop_.topLeft()).scaledBy(mode_, analogCrop_.size());
++
++	Size part = area.size().boundedToAspectRatio(output_).expandedTo(output_).boundedTo(mode_);
++	Rectangle region = part.centeredTo(area.center()).enclosedIn(Rectangle(mode_));
++
++	Size scaled(utils::alignUp(mode_.width * output_.width / part.width, 2),
++		    utils::alignUp(mode_.height * output_.height / part.height, 2));
++	scaled = scaled.boundedTo(mode_).expandedTo(output_);
++
++	Rectangle compose(scaled);
++	int ret = pix_->setSelection(0, V4L2_SEL_TGT_COMPOSE, &compose);
++	if (ret)
++		return ret;
++
++	Rectangle crop(region.x * scaled.width / mode_.width & ~1,
++		       region.y * scaled.height / mode_.height & ~1, output_);
++	crop = crop.enclosedIn(Rectangle(scaled));
++	ret = pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop);
++	if (ret)
++		return ret;
++
++	V4L2SubdeviceFormat out{};
++	out.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
++	out.size = output_;
++	ret = pix_->setFormat(1, &out);
++	if (ret)
++		return ret;
++
++	scalerCrop_ = region.scaledBy(analogCrop_.size(), mode_).translatedBy(analogCrop_.topLeft());
++
++	LOG(Camss, Debug)
++		<< "ScalerCrop " << scalerCrop << " shows " << scalerCrop_
++		<< ": scaled " << scaled << ", crop " << crop;
++
+ 	return 0;
+ }
+ 
+@@ -395,6 +451,7 @@
+ 	waiting_.erase(it);
+ 
+ 	request->_d()->metadata().merge(metadata);
++	request->_d()->metadata().set(controls::ScalerCrop, scalerCrop_);
+ 	pipe()->completeRequest(request);
+ }
+ 
+@@ -509,6 +566,17 @@
+ 	if (mode == modes.end())
+ 		return Invalid;
+ 
++	/* A sensor configuration picks the mode, if the output comes out of it */
++	if (sensorConfig) {
++		auto picked = std::find(modes.begin(), modes.end(), sensorConfig->outputSize);
++		if (sensorConfig->bitDepth != 10 || picked == modes.end() ||
++		    picked->width < size.width || picked->height < size.height ||
++		    picked->width > size.width * kMaxDownscale ||
++		    picked->height > size.height * kMaxDownscale)
++			return Invalid;
++		mode = picked;
++	}
++
+ 	/*
+ 	 * Hardware encoders such as Venus read NV12 with the chroma plane at a
+ 	 * luma height rounded up to a multiple of lines, from a buffer with some
+@@ -526,7 +594,6 @@
+ 	sensorFormat_ = {};
+ 	sensorFormat_.code = data_->bayerCode();
+ 	sensorFormat_.size = *mode;
+-	scaled_ = scaledMode(*mode, output_);
+ 
+ 	cfg.stride = info.stride(size.width, 0, 1);
+ 	cfg.frameSize = pad ? utils::alignUp(info.frameSize(output_, 1) + kEncoderSlack, 4096)
+@@ -627,24 +694,17 @@
+ 		}
+ 	}
+ 
+-	/* Scale the sensor mode, then crop the output out of its centre */
+-	Rectangle compose(config->scaled_);
+-	ret = data->pix_->setSelection(0, V4L2_SEL_TGT_COMPOSE, &compose);
++	ipa::camss::IPAConfigInfo ipaConfig;
++	ret = data->sensor_->sensorInfo(&ipaConfig.sensorInfo);
+ 	if (ret)
+ 		return ret;
+ 
+-	const Size &scaled = config->scaled_;
++	/* The whole field of view until a request asks for a ScalerCrop */
+ 	const Size &output = config->output_;
+-	Rectangle crop((scaled.width - output.width) / 2 & ~1,
+-		       (scaled.height - output.height) / 2 & ~1, output);
+-	ret = data->pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop);
+-	if (ret)
+-		return ret;
+-
+-	V4L2SubdeviceFormat out{};
+-	out.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+-	out.size = output;
+-	ret = data->pix_->setFormat(1, &out);
++	data->mode_ = format.size;
++	data->analogCrop_ = ipaConfig.sensorInfo.analogCrop;
++	data->output_ = output;
++	ret = data->applyCrop(data->analogCrop_);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -665,11 +725,6 @@
+ 
+ 	cfg.setStream(&data->stream_);
+ 
+-	ipa::camss::IPAConfigInfo ipaConfig;
+-	ret = data->sensor_->sensorInfo(&ipaConfig.sensorInfo);
+-	if (ret)
+-		return ret;
+-
+ 	ipaConfig.sensorControls = data->sensor_->controls();
+ 	if (CameraLens *lens = data->sensor_->focusLens())
+ 		ipaConfig.lensControls = lens->controls();
+@@ -679,8 +734,8 @@
+ 		return ret;
+ 
+ 	LOG(Camss, Info)
+-		<< "Sensor " << format << ", scaled " << config->scaled_
+-		<< ", crop " << crop << ", output " << cfg.toString();
++		<< "Sensor " << format << ", showing " << data->scalerCrop_
++		<< ", output " << cfg.toString();
+ 
+ 	return 0;
+ }
+@@ -706,12 +761,12 @@
+ 		return ret;
+ 	}
+ 
+-	ret = data->video_->streamOn();
+-	if (ret) {
+-		data->video_->releaseBuffers();
+-		data->ipa_->stop();
+-		return ret;
+-	}
++	/*
++	 * The VFE crop can't change while it streams, and applications such
++	 * as libcamerasrc send ScalerCrop with their first request rather than
++	 * to start(), so streaming starts with that request.
++	 */
++	data->streaming_ = false;
+ 
+ 	return 0;
+ }
+@@ -721,6 +776,7 @@
+ 	CamssCameraData *data = cameraData(camera);
+ 
+ 	data->video_->streamOff();
++	data->streaming_ = false;
+ 	data->video_->releaseBuffers();
+ 	data->ipa_->stop();
+ 
+@@ -740,7 +796,24 @@
+ 
+ 	data->ipa_->queueRequest(request->sequence(), request->controls());
+ 
+-	return data->video_->queueBuffer(buffer);
++	int ret = data->video_->queueBuffer(buffer);
++	if (ret || data->streaming_)
++		return ret;
++
++	const auto &scalerCrop = request->controls().get(controls::ScalerCrop);
++	if (scalerCrop) {
++		ret = data->applyCrop(*scalerCrop);
++		if (ret)
++			return ret;
++	}
++
++	ret = data->video_->streamOn();
++	if (ret)
++		return ret;
++
++	data->streaming_ = true;
++
++	return 0;
+ }
+ 
+ void PipelineHandlerCamss::bufferReady(FrameBuffer *buffer)
