@@ -1,0 +1,252 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: ipa: simple: manual exposure, gain and white balance
+
+The soft IPA only ran automatic exposure and white balance, so the
+ExposureTime, AnalogueGain and ColourGains an application set were
+ignored. Accept them with their modes and AwbEnable: manual values are
+held, and auto exposure regulates whichever of exposure and gain is
+still automatic.
+
+The gain is a multiplier, so add sensor helpers for the Fairphone 3+
+Samsung sensors, whose analogue gain code 32 is 1x.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ru a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -554,6 +554,28 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx219", CameraSensorHelperImx219)
+ 
++class CameraSensorHelperS5kgm1sp : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5kgm1sp()
++	{
++		/* Analogue gain code 32 is 1x */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5kgm1sp", CameraSensorHelperS5kgm1sp)
++
++class CameraSensorHelperS5k3p9sp : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3p9sp()
++	{
++		/* Analogue gain code 32 is 1x */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3p9sp", CameraSensorHelperS5k3p9sp)
++
+ class CameraSensorHelperImx258 : public CameraSensorHelper
+ {
+ public:
+diff -ru a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -17,6 +17,8 @@
+ 
+ LOG_DEFINE_CATEGORY(IPASoftExposure)
+ 
++using namespace std::literals::chrono_literals;
++
+ namespace ipa::soft::algorithms {
+ 
+ /*
+@@ -41,6 +43,49 @@
+ {
+ }
+ 
++int Agc::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++{
++	context.ctrlMap[&controls::ExposureTimeMode] =
++		ControlInfo({ { ControlValue(controls::ExposureTimeModeAuto),
++				ControlValue(controls::ExposureTimeModeManual) } },
++			    ControlValue(controls::ExposureTimeModeAuto));
++	context.ctrlMap[&controls::ExposureTime] =
++		ControlInfo(int32_t{ 1 }, int32_t{ 1000000 }, int32_t{ 10000 });
++	context.ctrlMap[&controls::AnalogueGainMode] =
++		ControlInfo({ { ControlValue(controls::AnalogueGainModeAuto),
++				ControlValue(controls::AnalogueGainModeManual) } },
++			    ControlValue(controls::AnalogueGainModeAuto));
++	context.ctrlMap[&controls::AnalogueGain] = ControlInfo(1.0f, 64.0f, 1.0f);
++
++	return 0;
++}
++
++void Agc::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		       [[maybe_unused]] IPAFrameContext &frameContext,
++		       const ControlList &controls)
++{
++	auto &agc = context.activeState.agc;
++
++	/* A value applies in manual mode, given in this request or before */
++	const auto &exposureMode = controls.get(controls::ExposureTimeMode);
++	bool manualExposure = exposureMode ? *exposureMode == controls::ExposureTimeModeManual
++					   : agc.manualExposureTime.has_value();
++	const auto &exposureTime = controls.get(controls::ExposureTime);
++	if (!manualExposure)
++		agc.manualExposureTime.reset();
++	else if (exposureTime)
++		agc.manualExposureTime = *exposureTime;
++
++	const auto &gainMode = controls.get(controls::AnalogueGainMode);
++	bool manualGain = gainMode ? *gainMode == controls::AnalogueGainModeManual
++				   : agc.manualGain.has_value();
++	const auto &gain = controls.get(controls::AnalogueGain);
++	if (!manualGain)
++		agc.manualGain.reset();
++	else if (gain)
++		agc.manualGain = *gain;
++}
++
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+ {
+ 	/*
+@@ -53,15 +98,18 @@
+ 
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
++	const auto &manual = context.activeState.agc;
++	const bool autoExposure = !manual.manualExposureTime;
++	const bool autoGain = !manual.manualGain;
+ 
+ 	if (exposureMSV < kExposureOptimal - kExposureSatisfactory) {
+-		if (exposure < context.configuration.agc.exposureMax) {
++		if (autoExposure && (exposure < context.configuration.agc.exposureMax || !autoGain)) {
+ 			int32_t next = exposure * kExpNumeratorUp / kExpDenominator;
+ 			if (next - exposure < 1)
+ 				exposure += 1;
+ 			else
+ 				exposure = next;
+-		} else {
++		} else if (autoGain) {
+ 			double next = again * kExpNumeratorUp / kExpDenominator;
+ 			if (next - again < context.configuration.agc.againMinStep)
+ 				again += context.configuration.agc.againMinStep;
+@@ -71,13 +119,13 @@
+ 	}
+ 
+ 	if (exposureMSV > kExposureOptimal + kExposureSatisfactory) {
+-		if (again > context.configuration.agc.again10) {
++		if (autoGain && (again > context.configuration.agc.again10 || !autoExposure)) {
+ 			double next = again * kExpNumeratorDown / kExpDenominator;
+ 			if (again - next < context.configuration.agc.againMinStep)
+ 				again -= context.configuration.agc.againMinStep;
+ 			else
+ 				again = next;
+-		} else {
++		} else if (autoExposure) {
+ 			int32_t next = exposure * kExpNumeratorDown / kExpDenominator;
+ 			if (exposure - next < 1)
+ 				exposure -= 1;
+@@ -86,6 +134,11 @@
+ 		}
+ 	}
+ 
++	if (manual.manualExposureTime)
++		exposure = *manual.manualExposureTime * 1.0us / context.configuration.agc.lineDuration;
++	if (manual.manualGain)
++		again = *manual.manualGain;
++
+ 	exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+ 			      context.configuration.agc.exposureMax);
+ 	again = std::clamp(again, context.configuration.agc.againMin,
+diff -ru a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -19,6 +19,11 @@
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
++
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+diff -ru a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -23,6 +23,30 @@
+ 
+ namespace ipa::soft::algorithms {
+ 
++int Awb::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++{
++	context.ctrlMap[&controls::AwbEnable] = ControlInfo(false, true, true);
++	context.ctrlMap[&controls::ColourGains] = ControlInfo(0.25f, 4.0f, 1.0f);
++
++	return 0;
++}
++
++void Awb::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		       [[maybe_unused]] IPAFrameContext &frameContext,
++		       const ControlList &controls)
++{
++	auto &awb = context.activeState.awb;
++
++	const auto &enable = controls.get(controls::AwbEnable);
++	if (enable)
++		awb.manual = !*enable;
++
++	/* Red and blue gains relative to green, applied while AWB is off */
++	const auto &colourGains = controls.get(controls::ColourGains);
++	if (colourGains && awb.manual)
++		awb.gains = { { (*colourGains)[0], 1.0f, (*colourGains)[1] } };
++}
++
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+@@ -65,7 +89,7 @@
+ 	};
+ 	metadata.set(controls::ColourGains, mdGains);
+ 
+-	if (!stats->valid)
++	if (!stats->valid || context.activeState.awb.manual)
+ 		return;
+ 
+ 	/*
+diff -ru a/src/ipa/simple/algorithms/awb.h b/src/ipa/simple/algorithms/awb.h
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -19,7 +19,11 @@
+ 	Awb() = default;
+ 	~Awb() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+diff -ru a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -47,6 +47,9 @@
+ 		int32_t exposure;
+ 		double again;
+ 		bool valid;
++		/* Values set by the application, which auto exposure leaves alone */
++		std::optional<int32_t> manualExposureTime;
++		std::optional<double> manualGain;
+ 	} agc;
+ 
+ 	struct {
+@@ -58,6 +61,8 @@
+ 	struct {
+ 		RGB<float> gains;
+ 		unsigned int temperatureK;
++		/* Gains held as set by the application */
++		bool manual;
+ 	} awb;
+ 
+ 	Matrix<float, 3, 3> combinedMatrix;
