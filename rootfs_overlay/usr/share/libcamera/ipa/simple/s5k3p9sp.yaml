@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# libcamera 0.7.1 software ISP ("simple" IPA) tuning for Fairphone 3+ front camera, Samsung S5K3P9SP, 10-bit GRBG.
+#
+# Values are taken from the Qualcomm chromatix 0x0310 tuning libraries shipped
+# in the phone vendor partition (32-bit vendor/lib):
+#   BlackLevel.blackLevel: libchromatix_s5k3p9sp_common.so, linearization/pedestal tables
+#     (.data+0x10b0, .data+0x48): pedestal 256 in 12-bit = 64 in 10-bit sensor units;
+#     64 (10-bit) << 6 = 4096 (16-bit), which the IPA shifts to 16 (8-bit).
+#   Ccm.ccms: libchromatix_s5k3p9sp_a3_default_preview.so, AWB-driven CCM table
+#     (awb_ccm, .data+0x189c). Identical in every *3a* variant of this sensor.
+#     Each "ct" is not the nominal illuminant CCT but the CCT that the simple IPA
+#     (libipa estimateCCT) computes for the Qualcomm AWB grey reference point of
+#     that illuminant (.data+0x30), so the interpolation lands on the intended
+#     matrix for this sensor. Matrices are row-major RGB->RGB, applied after the
+#     white-balance gains and before gamma; every row sums to 1.0.
+# The ISP chromatix (libchromatix_s5k3p9sp_preview.so) CC matrices are identity; gamma
+# and lens-shading tables exist there and in the common lib but the 0.7.1 simple
+# IPA has no tuning keys for them.
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  # The CCM adds a significant per-pixel cost to the CPU debayer; drop this block to disable it.
+  - Ccm:
+      ccms:
+        # Horizon (nominal ~2300 K), AWB ref R/G=0.8512 B/G=0.3118, CCM at .data+0x19f0
+        - ct: 3070
+          ccm: [  1.813175, -0.585829, -0.227346,
+                 -0.393258,  1.596116, -0.202858,
+                 -0.070972, -1.398791,  2.469763 ]
+        # A (nominal ~2850 K), AWB ref R/G=0.6726 B/G=0.3998, CCM at .data+0x19c0
+        - ct: 3680
+          ccm: [  1.824147, -0.819059, -0.005088,
+                 -0.336465,  1.259731,  0.076734,
+                 -0.166353, -1.374202,  2.540555 ]
+        # CoolWhite (nominal ~4100 K), AWB ref R/G=0.4384 B/G=0.4780, CCM at .data+0x1960
+        - ct: 4600
+          ccm: [  1.573889, -0.591308,  0.017419,
+                 -0.258859,  1.520491, -0.261632,
+                  0.126281, -0.860467,  1.734185 ]
+        # D50 (nominal ~5000 K), AWB ref R/G=0.4109 B/G=0.6772, CCM at .data+0x1930
+        - ct: 6180
+          ccm: [  1.506528, -0.347759, -0.158768,
+                 -0.211359,  1.526941, -0.315581,
+                  0.081385, -0.708918,  1.627533 ]
+        # D65 (nominal ~6500 K), AWB ref R/G=0.3485 B/G=0.7709, CCM at .data+0x1900
+        - ct: 7630
+          ccm: [  1.464512, -0.336554, -0.127957,
+                 -0.186786,  1.547376, -0.360589,
+                  0.079886, -0.625059,  1.545173 ]
+        # D75 (outdoor set) (nominal ~7500 K), AWB ref R/G=0.3251 B/G=0.8700, CCM at .data+0x1c60
+        - ct: 9660
+          ccm: [  1.445341, -0.329749, -0.115592,
+                 -0.177116,  1.559218, -0.382102,
+                  0.077988, -0.595574,  1.517587 ]
+  - Adjust:
+  - Agc:
+...
