@@ -1,0 +1,639 @@
+From: Marc Lainez <marc.lainez@gmail.com>
+Subject: [PATCH] libcamera: pipeline: camss: Qualcomm VFE pixel path
+
+Add a pipeline handler for the camss VFE pixel path, which debayers,
+white balances, colour corrects and scales in hardware and outputs NV12.
+Each camera takes its own CSID, ISPIF and VFE. The handler picks the
+smallest sensor mode that covers the output within the 4288 pixel input
+line, downscales and centre crops in the VFE, and keeps widths to
+multiples of 16 pixels for the write masters.
+
+The simple pipeline handler no longer claims qcom-camss.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -215,6 +215,7 @@
+ arch_arm = ['arm', 'aarch64']
+ arch_x86 = ['x86', 'x86_64']
+ pipelines_support = {
++    'camss':        arch_arm,
+     'imx8-isi':     arch_arm,
+     'ipu3':         arch_x86,
+     'mali-c55':     arch_arm,
+diff -ruN a/meson_options.txt b/meson_options.txt
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -78,6 +78,7 @@
+         choices : [
+             'all',
+             'auto',
++            'camss',
+             'imx8-isi',
+             'ipu3',
+             'mali-c55',
+diff -ruN a/src/libcamera/pipeline/camss/camss.cpp b/src/libcamera/pipeline/camss/camss.cpp
+--- a/src/libcamera/pipeline/camss/camss.cpp
++++ b/src/libcamera/pipeline/camss/camss.cpp
+@@ -0,0 +1,579 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Pipeline handler for the Qualcomm CAMSS VFE pixel path
++ *
++ * The VFE pixel path of camss debayers, white balances, colour corrects and
++ * scales in hardware, and hands out NV12. Each camera takes its own CSID,
++ * ISPIF and VFE, so as many cameras stream at once as the SoC has VFEs.
++ */
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <memory>
++#include <set>
++#include <string>
++#include <vector>
++
++#include <linux/media-bus-format.h>
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++#include <libcamera/camera_manager.h>
++#include <libcamera/color_space.h>
++#include <libcamera/control_ids.h>
++#include <libcamera/formats.h>
++#include <libcamera/geometry.h>
++#include <libcamera/ipa/core_ipa_interface.h>
++#include <libcamera/stream.h>
++
++#include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_sensor.h"
++#include "libcamera/internal/device_enumerator.h"
++#include "libcamera/internal/media_device.h"
++#include "libcamera/internal/pipeline_handler.h"
++#include "libcamera/internal/request.h"
++#include "libcamera/internal/v4l2_subdevice.h"
++#include "libcamera/internal/v4l2_videodevice.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(Camss)
++
++namespace {
++
++/* Widest line the VFE pixel path takes in from the sensor */
++constexpr unsigned int kMaxInputWidth = 4288;
++
++/* The VFE scaler only downscales, by up to this ratio */
++constexpr unsigned int kMaxDownscale = 16;
++
++/* The write masters take lines in multiples of 16 pixels */
++constexpr unsigned int kWidthAlign = 16;
++
++constexpr unsigned int kBufferCount = 4;
++constexpr unsigned int kDefaultFps = 30;
++
++/* Bayer orders the pixel path debayers */
++const std::array<unsigned int, 1> kBayerCodes = { MEDIA_BUS_FMT_SGRBG10_1X10 };
++
++/*
++ * The part of a sensor mode with the output's aspect ratio, scaled down so
++ * the output crops out of its full width or height.
++ */
++Size scaledMode(const Size &mode, const Size &out)
++{
++	double ratio = std::max(static_cast<double>(out.width) / mode.width,
++				static_cast<double>(out.height) / mode.height);
++
++	Size scaled(std::ceil(mode.width * ratio), std::ceil(mode.height * ratio));
++	scaled.alignUpTo(2, 2);
++
++	return scaled.boundedTo(mode);
++}
++
++} /* namespace */
++
++class PipelineHandlerCamss;
++
++class CamssCameraData : public Camera::Private
++{
++public:
++	CamssCameraData(PipelineHandler *pipe, unsigned int index)
++		: Camera::Private(pipe), index_(index)
++	{
++	}
++
++	int init(MediaDevice *media, MediaEntity *sensor);
++	int setupLinks();
++
++	/* The sensor modes the pixel path takes, smallest first */
++	std::vector<Size> modes() const;
++
++	unsigned int index_;
++
++	std::unique_ptr<CameraSensor> sensor_;
++	std::unique_ptr<V4L2Subdevice> csiphy_;
++	std::unique_ptr<V4L2Subdevice> csid_;
++	std::unique_ptr<V4L2Subdevice> ispif_;
++	std::unique_ptr<V4L2Subdevice> pix_;
++	std::unique_ptr<V4L2VideoDevice> video_;
++
++	/* Links of this camera's path, sensor side first */
++	std::array<MediaLink *, 3> links_;
++
++	Stream stream_;
++};
++
++class CamssCameraConfiguration : public CameraConfiguration
++{
++public:
++	CamssCameraConfiguration(CamssCameraData *data)
++		: data_(data)
++	{
++	}
++
++	Status validate() override;
++
++	/* Chosen by validate() */
++	V4L2SubdeviceFormat sensorFormat_;
++	Size scaled_;
++
++private:
++	const CamssCameraData *data_;
++};
++
++class PipelineHandlerCamss : public PipelineHandler
++{
++public:
++	PipelineHandlerCamss(CameraManager *manager)
++		: PipelineHandler(manager)
++	{
++	}
++
++	bool match(DeviceEnumerator *enumerator) override;
++
++	std::unique_ptr<CameraConfiguration>
++	generateConfiguration(Camera *camera, Span<const StreamRole> roles) override;
++	int configure(Camera *camera, CameraConfiguration *config) override;
++
++	int exportFrameBuffers(Camera *camera, Stream *stream,
++			       std::vector<std::unique_ptr<FrameBuffer>> *buffers) override;
++
++	int start(Camera *camera, const ControlList *controls) override;
++
++protected:
++	void stopDevice(Camera *camera) override;
++	int queueRequestDevice(Camera *camera, Request *request) override;
++
++private:
++	CamssCameraData *cameraData(Camera *camera)
++	{
++		return static_cast<CamssCameraData *>(camera->_d());
++	}
++
++	void bufferReady(FrameBuffer *buffer);
++
++	std::shared_ptr<MediaDevice> media_;
++};
++
++/* -----------------------------------------------------------------------------
++ * Camera data
++ */
++
++int CamssCameraData::init(MediaDevice *media, MediaEntity *sensor)
++{
++	sensor_ = CameraSensorFactoryBase::create(sensor);
++	if (!sensor_)
++		return -ENODEV;
++
++	if (modes().empty()) {
++		LOG(Camss, Info)
++			<< sensor->name() << " has no mode the pixel path takes";
++		return -EINVAL;
++	}
++
++	/* The CSIPHY the sensor is wired to, then this camera's own path */
++	MediaEntity *csiphy = nullptr;
++	for (const MediaPad *pad : sensor->pads()) {
++		if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
++			continue;
++		for (MediaLink *link : pad->links())
++			csiphy = link->sink()->entity();
++	}
++	if (!csiphy)
++		return -ENOLINK;
++
++	const std::string n = std::to_string(index_);
++	csiphy_ = std::make_unique<V4L2Subdevice>(csiphy);
++	csid_ = V4L2Subdevice::fromEntityName(media, "msm_csid" + n);
++	ispif_ = V4L2Subdevice::fromEntityName(media, "msm_ispif" + n);
++	pix_ = V4L2Subdevice::fromEntityName(media, "msm_vfe" + n + "_pix");
++	video_ = V4L2VideoDevice::fromEntityName(media, "msm_vfe" + n + "_video3");
++	if (!csid_ || !ispif_ || !pix_ || !video_)
++		return -ENODEV;
++
++	for (V4L2Subdevice *subdev : { csiphy_.get(), csid_.get(), ispif_.get(), pix_.get() }) {
++		int ret = subdev->open();
++		if (ret)
++			return ret;
++	}
++
++	int ret = video_->open();
++	if (ret)
++		return ret;
++
++	const std::array<std::pair<const MediaEntity *, const MediaEntity *>, 3> hops = { {
++		{ csiphy, csid_->entity() },
++		{ csid_->entity(), ispif_->entity() },
++		{ ispif_->entity(), pix_->entity() },
++	} };
++
++	for (unsigned int i = 0; i < hops.size(); i++) {
++		links_[i] = media->link(hops[i].first, 1, hops[i].second, 0);
++		if (!links_[i])
++			return -ENOLINK;
++	}
++
++	properties_ = sensor_->properties();
++
++	return 0;
++}
++
++/*
++ * Enable this camera's links and disable every other enabled link into or
++ * out of the entities it uses, such as those another user left behind.
++ */
++int CamssCameraData::setupLinks()
++{
++	for (MediaLink *ours : links_) {
++		for (const MediaPad *pad : { ours->source(), ours->sink() }) {
++			for (MediaLink *link : pad->links()) {
++				if (link == ours || !(link->flags() & MEDIA_LNK_FL_ENABLED))
++					continue;
++				if (link->flags() & MEDIA_LNK_FL_IMMUTABLE)
++					continue;
++
++				int ret = link->setEnabled(false);
++				if (ret)
++					return ret;
++			}
++		}
++
++		if (!(ours->flags() & MEDIA_LNK_FL_ENABLED)) {
++			int ret = ours->setEnabled(true);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return 0;
++}
++
++std::vector<Size> CamssCameraData::modes() const
++{
++	std::vector<Size> modes;
++
++	for (unsigned int code : kBayerCodes) {
++		for (const Size &size : sensor_->sizes(code)) {
++			if (size.width <= kMaxInputWidth)
++				modes.push_back(size);
++		}
++	}
++
++	std::sort(modes.begin(), modes.end(),
++		  [](const Size &a, const Size &b) { return a.width * a.height < b.width * b.height; });
++	modes.erase(std::unique(modes.begin(), modes.end()), modes.end());
++
++	return modes;
++}
++
++/* -----------------------------------------------------------------------------
++ * Camera configuration
++ */
++
++CameraConfiguration::Status CamssCameraConfiguration::validate()
++{
++	Status status = Valid;
++
++	if (config_.empty())
++		return Invalid;
++
++	if (config_.size() > 1) {
++		config_.resize(1);
++		status = Adjusted;
++	}
++
++	StreamConfiguration &cfg = config_[0];
++
++	if (cfg.pixelFormat != formats::NV12) {
++		cfg.pixelFormat = formats::NV12;
++		status = Adjusted;
++	}
++
++	std::vector<Size> modes = data_->modes();
++	const Size &largest = modes.back();
++
++	/* Fit the output in the largest mode, aligned for the write masters */
++	Size size = cfg.size.boundedTo(largest);
++	size.width = size.width / kWidthAlign * kWidthAlign;
++	size.height &= ~1U;
++	size.expandTo({ largest.width / kMaxDownscale, largest.height / kMaxDownscale });
++	size.width = utils::alignUp(size.width, kWidthAlign);
++
++	if (size != cfg.size) {
++		LOG(Camss, Debug) << "Adjusting size " << cfg.size << " to " << size;
++		cfg.size = size;
++		status = Adjusted;
++	}
++
++	/* The smallest mode that covers the output without upscaling */
++	auto mode = std::find_if(modes.begin(), modes.end(), [&](const Size &m) {
++		return m.width >= size.width && m.height >= size.height &&
++		       m.width <= size.width * kMaxDownscale &&
++		       m.height <= size.height * kMaxDownscale;
++	});
++	if (mode == modes.end())
++		return Invalid;
++
++	sensorFormat_ = {};
++	sensorFormat_.code = kBayerCodes[0];
++	sensorFormat_.size = *mode;
++	scaled_ = scaledMode(*mode, size);
++
++	const PixelFormatInfo &info = PixelFormatInfo::info(cfg.pixelFormat);
++	cfg.stride = info.stride(size.width, 0, 1);
++	cfg.frameSize = info.frameSize(size, 1);
++	cfg.bufferCount = std::max(cfg.bufferCount, kBufferCount);
++
++	/* The VFE converts to full range BT.601 */
++	if (cfg.colorSpace != ColorSpace::Sycc) {
++		cfg.colorSpace = ColorSpace::Sycc;
++		status = Adjusted;
++	}
++
++	return status;
++}
++
++/* -----------------------------------------------------------------------------
++ * Pipeline handler
++ */
++
++std::unique_ptr<CameraConfiguration>
++PipelineHandlerCamss::generateConfiguration(Camera *camera, Span<const StreamRole> roles)
++{
++	CamssCameraData *data = cameraData(camera);
++	auto config = std::make_unique<CamssCameraConfiguration>(data);
++
++	if (roles.empty())
++		return config;
++
++	if (roles.size() > 1) {
++		LOG(Camss, Error) << "Only one stream is supported";
++		return nullptr;
++	}
++
++	std::vector<Size> modes = data->modes();
++	const Size &largest = modes.back();
++	Size size;
++
++	switch (roles[0]) {
++	case StreamRole::StillCapture:
++		size = largest;
++		break;
++	case StreamRole::VideoRecording:
++	case StreamRole::Viewfinder:
++		size = Size(1920, 1080).boundedTo(largest);
++		break;
++	default:
++		LOG(Camss, Error) << "Stream role " << roles[0] << " is not supported";
++		return nullptr;
++	}
++
++	std::map<PixelFormat, std::vector<SizeRange>> streamFormats;
++	streamFormats[formats::NV12] = {
++		SizeRange({ largest.width / kMaxDownscale, largest.height / kMaxDownscale },
++			  largest, kWidthAlign, 2)
++	};
++
++	StreamConfiguration cfg{ StreamFormats{ streamFormats } };
++	cfg.pixelFormat = formats::NV12;
++	cfg.size = size;
++	cfg.bufferCount = kBufferCount;
++	cfg.colorSpace = ColorSpace::Sycc;
++
++	config->addConfiguration(cfg);
++	config->validate();
++
++	return config;
++}
++
++int PipelineHandlerCamss::configure(Camera *camera, CameraConfiguration *c)
++{
++	auto *config = static_cast<CamssCameraConfiguration *>(c);
++	CamssCameraData *data = cameraData(camera);
++	StreamConfiguration &cfg = config->at(0);
++	int ret;
++
++	ret = data->setupLinks();
++	if (ret) {
++		LOG(Camss, Error) << "Failed to set up links: " << strerror(-ret);
++		return ret;
++	}
++
++	V4L2SubdeviceFormat format = config->sensorFormat_;
++	ret = data->sensor_->setFormat(&format);
++	if (ret)
++		return ret;
++
++	/* The Bayer format runs unchanged up to the VFE pixel path */
++	for (V4L2Subdevice *subdev : { data->csiphy_.get(), data->csid_.get(),
++				       data->ispif_.get(), data->pix_.get() }) {
++		V4L2SubdeviceFormat f = format;
++		ret = subdev->setFormat(0, &f);
++		if (ret)
++			return ret;
++		if (f.code != format.code || f.size != format.size) {
++			LOG(Camss, Error)
++				<< subdev->entity()->name() << " took " << f << " for " << format;
++			return -EINVAL;
++		}
++	}
++
++	/* Scale the sensor mode, then crop the output out of its centre */
++	Rectangle compose(config->scaled_);
++	ret = data->pix_->setSelection(0, V4L2_SEL_TGT_COMPOSE, &compose);
++	if (ret)
++		return ret;
++
++	const Size &scaled = config->scaled_;
++	Rectangle crop((scaled.width - cfg.size.width) / 2 & ~1,
++		       (scaled.height - cfg.size.height) / 2 & ~1, cfg.size);
++	ret = data->pix_->setSelection(1, V4L2_SEL_TGT_CROP, &crop);
++	if (ret)
++		return ret;
++
++	V4L2SubdeviceFormat out{};
++	out.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
++	out.size = cfg.size;
++	ret = data->pix_->setFormat(1, &out);
++	if (ret)
++		return ret;
++
++	V4L2DeviceFormat videoFormat{};
++	videoFormat.fourcc = data->video_->toV4L2PixelFormat(cfg.pixelFormat);
++	videoFormat.size = cfg.size;
++	videoFormat.planesCount = 1;
++	ret = data->video_->setFormat(&videoFormat);
++	if (ret)
++		return ret;
++
++	if (videoFormat.size != cfg.size) {
++		LOG(Camss, Error) << "Video node took " << videoFormat.size;
++		return -EINVAL;
++	}
++
++	cfg.setStream(&data->stream_);
++
++	LOG(Camss, Info)
++		<< "Sensor " << format << ", scaled " << config->scaled_
++		<< ", crop " << crop << ", output " << cfg.toString();
++
++	return 0;
++}
++
++int PipelineHandlerCamss::exportFrameBuffers(Camera *camera, Stream *stream,
++					     std::vector<std::unique_ptr<FrameBuffer>> *buffers)
++{
++	return cameraData(camera)->video_->exportBuffers(stream->configuration().bufferCount,
++							 buffers);
++}
++
++int PipelineHandlerCamss::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++{
++	CamssCameraData *data = cameraData(camera);
++
++	/* Frame length for the default frame rate */
++	IPACameraSensorInfo info;
++	int ret = data->sensor_->sensorInfo(&info);
++	if (ret)
++		return ret;
++
++	unsigned int lines = info.pixelRate / (info.minLineLength * kDefaultFps);
++	int32_t vblank = std::max<int32_t>(lines - info.outputSize.height, 0);
++
++	ControlList sensorControls(data->sensor_->controls());
++	sensorControls.set(V4L2_CID_VBLANK, vblank);
++	ret = data->sensor_->setControls(&sensorControls);
++	if (ret)
++		return ret;
++
++	ret = data->video_->importBuffers(data->stream_.configuration().bufferCount);
++	if (ret)
++		return ret;
++
++	ret = data->video_->streamOn();
++	if (ret) {
++		data->video_->releaseBuffers();
++		return ret;
++	}
++
++	return 0;
++}
++
++void PipelineHandlerCamss::stopDevice(Camera *camera)
++{
++	CamssCameraData *data = cameraData(camera);
++
++	data->video_->streamOff();
++	data->video_->releaseBuffers();
++}
++
++int PipelineHandlerCamss::queueRequestDevice(Camera *camera, Request *request)
++{
++	CamssCameraData *data = cameraData(camera);
++	FrameBuffer *buffer = request->findBuffer(&data->stream_);
++
++	if (!buffer)
++		return -ENOENT;
++
++	return data->video_->queueBuffer(buffer);
++}
++
++void PipelineHandlerCamss::bufferReady(FrameBuffer *buffer)
++{
++	Request *request = buffer->request();
++
++	request->_d()->metadata().set(controls::SensorTimestamp,
++				      buffer->metadata().timestamp);
++
++	completeBuffer(request, buffer);
++	completeRequest(request);
++}
++
++bool PipelineHandlerCamss::match(DeviceEnumerator *enumerator)
++{
++	DeviceMatch dm("qcom-camss");
++	dm.add("msm_vfe0_pix");
++
++	media_ = acquireMediaDevice(enumerator, dm);
++	if (!media_)
++		return false;
++
++	unsigned int index = 0;
++
++	for (MediaEntity *entity : media_->entities()) {
++		if (entity->function() != MEDIA_ENT_F_CAM_SENSOR)
++			continue;
++
++		/* One VFE pixel path per camera */
++		if (!media_->getEntityByName("msm_vfe" + std::to_string(index) + "_pix")) {
++			LOG(Camss, Warning)
++				<< "No VFE pixel path left for " << entity->name();
++			break;
++		}
++
++		auto data = std::make_unique<CamssCameraData>(this, index);
++		int ret = data->init(media_.get(), entity);
++		if (ret) {
++			LOG(Camss, Warning)
++				<< "Skipping " << entity->name() << ": " << strerror(-ret);
++			continue;
++		}
++
++		data->video_->bufferReady.connect(this, &PipelineHandlerCamss::bufferReady);
++
++		const std::string id = data->sensor_->id();
++		std::set<Stream *> streams = { &data->stream_ };
++		registerCamera(Camera::create(std::move(data), id, streams));
++		index++;
++	}
++
++	return index > 0;
++}
++
++REGISTER_PIPELINE_HANDLER(PipelineHandlerCamss, "camss")
++
++} /* namespace libcamera */
+diff -ruN a/src/libcamera/pipeline/camss/meson.build b/src/libcamera/pipeline/camss/meson.build
+--- a/src/libcamera/pipeline/camss/meson.build
++++ b/src/libcamera/pipeline/camss/meson.build
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: CC0-1.0
++
++libcamera_internal_sources += files([
++    'camss.cpp',
++])
+diff -ruN a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -263,7 +263,6 @@
+ 	{ "j721e-csi2rx", {}, true },
+ 	{ "mtk-seninf", { { "mtk-mdp", 3 } }, false },
+ 	{ "mxc-isi", {}, false },
+-	{ "qcom-camss", {}, true },
+ 	{ "sun6i-csi", {}, false },
+ };
+ 
