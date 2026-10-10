@@ -5,7 +5,8 @@ Encoders take NV12, so an RGB debayer output has to be converted in a
 second pass over the whole frame, which costs more than the debayering
 itself at 1080p on a Cortex-A53. Offer NV12 from the CPU debayer: each
 pair of lines is debayered to RGB888 line buffers and converted to two
-luma lines and one chroma line while still in the cache.
+luma lines and one chroma line while still in the cache, sixteen pixels
+at a time with NEON where available.
 
 The conversion is full range BT.601, the sYCC colour space the simple
 pipeline handler assigns to NV12.
@@ -13,9 +14,20 @@ pipeline handler assigns to NV12.
 Assisted-by: Claude:claude-opus-5-5
 ---
 diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
---- a/src/libcamera/software_isp/debayer_cpu.cpp
-+++ b/src/libcamera/software_isp/debayer_cpu.cpp
-@@ -49,6 +49,8 @@
+--- a/src/libcamera/software_isp/debayer_cpu.cpp	2026-10-10 04:47:46.564540989 +0200
++++ b/src/libcamera/software_isp/debayer_cpu.cpp	2026-10-10 04:48:07.365383550 +0200
+@@ -18,6 +18,10 @@
+ 
+ #include <linux/dma-buf.h>
+ 
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
+ #include <libcamera/base/thread.h>
+ 
+ #include <libcamera/formats.h>
+@@ -49,6 +53,8 @@
  	void memcpyNextLine(const uint8_t *linePointers[]);
  	void process2(uint32_t frame, const uint8_t *src, uint8_t *dst);
  	void process4(uint32_t frame, const uint8_t *src, uint8_t *dst);
@@ -24,7 +36,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  
  	/* Max. supported Bayer pattern height is 4, debayering this requires 5 lines */
  	static constexpr unsigned int kMaxLineBuffers = 5;
-@@ -62,6 +64,9 @@
+@@ -62,6 +68,9 @@
  	unsigned int lineBufferIndex_;
  	std::vector<uint8_t> lineBuffers_[kMaxLineBuffers];
  	bool enableInputMemcpy_;
@@ -34,7 +46,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  };
  
  /**
-@@ -371,7 +376,8 @@
+@@ -371,7 +380,8 @@
  								  formats::ARGB8888,
  								  formats::BGR888,
  								  formats::XBGR8888,
@@ -44,7 +56,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  		return 0;
  	}
  
-@@ -386,7 +392,8 @@
+@@ -386,7 +396,8 @@
  								  formats::ARGB8888,
  								  formats::BGR888,
  								  formats::XBGR8888,
@@ -54,7 +66,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  		return 0;
  	}
  
-@@ -408,6 +415,12 @@
+@@ -408,6 +419,12 @@
  		return 0;
  	}
  
@@ -67,7 +79,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  	LOG(Debayer, Info)
  		<< "Unsupported output format " << outputFormat.toString();
  	return -EINVAL;
-@@ -458,6 +471,10 @@
+@@ -458,6 +475,10 @@
  	xShift_ = 0;
  	swapRedBlueGains_ = false;
  
@@ -78,7 +90,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  	auto invalidFmt = []() -> int {
  		LOG(Debayer, Error) << "Unsupported input output format combination";
  		return -EINVAL;
-@@ -648,6 +665,11 @@
+@@ -648,6 +669,11 @@
  		for (unsigned int i = 0; i <= inputConfig.patternSize.height; i++)
  			lineBuffers_[i].resize(lineBufferLength_);
  	}
@@ -90,7 +102,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  }
  
  /*
-@@ -685,6 +707,9 @@
+@@ -685,6 +711,9 @@
  	/* round up to multiple of 8 for 64 bits alignment */
  	unsigned int stride = (size.width * config.bpp / 8 + 7) & ~7;
  
@@ -100,7 +112,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  	return std::make_tuple(stride, stride * size.height);
  }
  
-@@ -745,6 +770,9 @@
+@@ -745,6 +774,9 @@
  	/* Adjust src to top left corner of the window */
  	src += (window.y + yStart_) * debayer_->inputConfig_.stride +
  	       window.x * debayer_->inputConfig_.bpp / 8;
@@ -110,7 +122,7 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  	/* Adjust dst for yStart_ */
  	dst += yStart_ * debayer_->outputConfig_.stride;
  
-@@ -797,32 +825,82 @@
+@@ -797,32 +829,147 @@
  		shiftLinePointers(linePointers, src);
  		memcpyNextLine(linePointers);
  		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
@@ -162,6 +174,49 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
 +	return debayer_->outputNV12_ ? rgbLines_[i].data() : dst;
 +}
 +
++#if defined(__ARM_NEON)
++namespace {
++
++/* Luma of sixteen B, G, R pixels, rounded as in storeNV12() */
++uint8x16_t lumaNeon(const uint8x16x3_t &p)
++{
++	uint16x8_t lo = vmull_u8(vget_low_u8(p.val[2]), vdup_n_u8(77));
++	lo = vmlal_u8(lo, vget_low_u8(p.val[1]), vdup_n_u8(150));
++	lo = vmlal_u8(lo, vget_low_u8(p.val[0]), vdup_n_u8(29));
++
++	uint16x8_t hi = vmull_u8(vget_high_u8(p.val[2]), vdup_n_u8(77));
++	hi = vmlal_u8(hi, vget_high_u8(p.val[1]), vdup_n_u8(150));
++	hi = vmlal_u8(hi, vget_high_u8(p.val[0]), vdup_n_u8(29));
++
++	return vcombine_u8(vrshrn_n_u16(lo, 8), vrshrn_n_u16(hi, 8));
++}
++
++/* One chroma component of eight 2x2 blocks from their R, G, B sums */
++uint8x8_t chromaNeon(int16x8_t r, int16x8_t g, int16x8_t b,
++		     int16_t kr, int16_t kg, int16_t kb)
++{
++	const int32x4_t bias = vdupq_n_s32(512 + 128 * 1024);
++
++	int32x4_t lo = vmlal_n_s16(bias, vget_low_s16(r), kr);
++	lo = vmlal_n_s16(lo, vget_low_s16(g), kg);
++	lo = vmlal_n_s16(lo, vget_low_s16(b), kb);
++
++	int32x4_t hi = vmlal_n_s16(bias, vget_high_s16(r), kr);
++	hi = vmlal_n_s16(hi, vget_high_s16(g), kg);
++	hi = vmlal_n_s16(hi, vget_high_s16(b), kb);
++
++	return vqmovn_u16(vcombine_u16(vqshrun_n_s32(lo, 10), vqshrun_n_s32(hi, 10)));
++}
++
++/* Sums of each horizontal pair of a and b, the 2x2 blocks of two lines */
++int16x8_t blockSums(uint8x16_t a, uint8x16_t b)
++{
++	return vreinterpretq_s16_u16(vaddq_u16(vpaddlq_u8(a), vpaddlq_u8(b)));
++}
++
++} /* namespace */
++#endif
++
 +/*
 + * Convert the two RGB888 lines just debayered to two luma lines at dst and
 + * one line of interleaved chroma, averaged over each 2x2 block. Full range
@@ -179,8 +234,29 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
 +	uint8_t *uv = uvDst_;
 +	unsigned int width = debayer_->window_.width;
 +
++	unsigned int x = 0;
++
++#if defined(__ARM_NEON)
++	for (; x + 16 <= width; x += 16) {
++		uint8x16x3_t a = vld3q_u8(top + 3 * x);
++		uint8x16x3_t b = vld3q_u8(bottom + 3 * x);
++
++		vst1q_u8(y0 + x, lumaNeon(a));
++		vst1q_u8(y1 + x, lumaNeon(b));
++
++		int16x8_t bs = blockSums(a.val[0], b.val[0]);
++		int16x8_t gs = blockSums(a.val[1], b.val[1]);
++		int16x8_t rs = blockSums(a.val[2], b.val[2]);
++
++		uint8x8x2_t c;
++		c.val[0] = chromaNeon(rs, gs, bs, -43, -85, 128);
++		c.val[1] = chromaNeon(rs, gs, bs, 128, -107, -21);
++		vst2_u8(uv + x, c);
++	}
++#endif
++
 +	/* RGB888 is stored B, G, R */
-+	for (unsigned int x = 0; x < width; x += 2) {
++	for (; x < width; x += 2) {
 +		const uint8_t *a = top + 3 * x;
 +		const uint8_t *b = bottom + 3 * x;
 +
@@ -193,8 +269,9 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
 +		int gs = a[1] + a[4] + b[1] + b[4];
 +		int rs = a[2] + a[5] + b[2] + b[5];
 +
-+		uv[x] = std::clamp((-43 * rs - 85 * gs + 128 * bs + 512) / 1024 + 128, 0, 255);
-+		uv[x + 1] = std::clamp((128 * rs - 107 * gs - 21 * bs + 512) / 1024 + 128, 0, 255);
++		/* The bias keeps the sums positive, so the shift rounds them */
++		uv[x] = std::min((-43 * rs - 85 * gs + 128 * bs + 512 + 128 * 1024) >> 10, 255);
++		uv[x + 1] = std::min((128 * rs - 107 * gs - 21 * bs + 512 + 128 * 1024) >> 10, 255);
  	}
 +
 +	uvDst_ += stride;
@@ -202,8 +279,8 @@ diff -ru a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_i
  
  void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst)
 diff -ru a/src/libcamera/software_isp/debayer_cpu.h b/src/libcamera/software_isp/debayer_cpu.h
---- a/src/libcamera/software_isp/debayer_cpu.h
-+++ b/src/libcamera/software_isp/debayer_cpu.h
+--- a/src/libcamera/software_isp/debayer_cpu.h	2026-10-10 04:47:46.564656679 +0200
++++ b/src/libcamera/software_isp/debayer_cpu.h	2026-10-10 04:47:46.563635832 +0200
 @@ -146,6 +146,7 @@
  	Rectangle window_;
  	std::unique_ptr<SwStatsCpu> stats_;
