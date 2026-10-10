@@ -93,7 +93,7 @@ diff -ruN a/meson_options.txt b/meson_options.txt
 diff -ruN a/src/ipa/camss/camss.cpp b/src/ipa/camss/camss.cpp
 --- a/src/ipa/camss/camss.cpp
 +++ b/src/ipa/camss/camss.cpp
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,473 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Image processing algorithms for the Qualcomm camss VFE pixel path
@@ -146,8 +146,13 @@ diff -ruN a/src/ipa/camss/camss.cpp b/src/ipa/camss/camss.cpp
 +/* Share of pixels in the top luminance bin exposure backs off from */
 +constexpr double kClipped = 0.02;
 +
-+/* Fraction of the correction, in log space, applied per adjustment */
++/*
++ * Fraction of the correction, in log space, applied per adjustment once
++ * exposure is within kAgcNear of its target; further off, the whole
++ * correction is applied so a cold start converges in a few frames.
++ */
 +constexpr double kAgcSpeed = 0.6;
++constexpr double kAgcNear = 2.0;
 +constexpr double kAwbSpeed = 0.3;
 +
 +/* Frames a sensor change takes to show in the statistics */
@@ -468,11 +473,12 @@ diff -ruN a/src/ipa/camss/camss.cpp b/src/ipa/camss/camss.cpp
 +	double mean = sum / total;
 +	double clipped = static_cast<double>(hist.back()) / total;
 +
-+	double ratio = std::clamp(kTarget / std::max(mean, 1e-4), 0.25, 4.0);
++	double ratio = std::clamp(kTarget / std::max(mean, 1e-4), 0.125, 8.0);
 +	if (clipped > kClipped)
 +		ratio = std::min(ratio, 0.8);
 +
-+	double target = exposure_ * gain_ * std::pow(ratio, kAgcSpeed);
++	bool near = ratio < kAgcNear && ratio > 1.0 / kAgcNear;
++	double target = exposure_ * gain_ * std::pow(ratio, near ? kAgcSpeed : 1.0);
 +	int32_t exposure = exposure_;
 +	double gain = gain_;
 +
