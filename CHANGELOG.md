@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Both microphones of a Fairphone 3 at once. Routing the top mic onto a
+  second SLIMbus TX port ("AIF1_CAP Mixer SLIM TX8") recorded silence,
+  overflowed TX7 and crashed the kernel: the WCD9335 driver armed only
+  the lowest port of a capture DAI (`patches/linux/0001`). With both
+  ports armed the two channels came back bit-identical, because the
+  SLIMBUS_0_TX backend fixup left the channel count at its minimum of 1
+  and the ADSP opened a mono COPP for a two-port capture; the backend now
+  takes the number of codec TX ports (`patches/linux/0002`). Capturing
+  `hw:0,1` with as many channels as ports routed gives one channel per
+  mic; a mismatch no longer crashes (the ADSP down- or up-mixes).
+
 ## v0.3.0
 
 The cameras now run through the phone's camera image processor (the

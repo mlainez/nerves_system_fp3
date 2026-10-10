@@ -1,0 +1,50 @@
+From: Lars Wikman <lars@underjord.io>
+Subject: [PATCH] ASoC: qcom: apq8016_sbc: size the SLIMBUS_0_TX backend by the codec TX ports
+
+The SLIMBUS_0_TX backend fixup only set channels->min = 1. The COPP that
+q6routing opens for the backend takes params_channels(), which is the
+interval's min, so the backend always ran mono however many codec TX
+ports were routed into AIF1_CAP. With the two digital mics of a
+Fairphone 3 on SLIM TX7 and TX8 the codec sent two SLIMbus channels and
+the AFE port was configured for two (q6slim_set_channel_map), but the
+COPP was mono and the ADSP copied the first mic into both front-end
+channels: a two-channel capture came back with bit-identical channels.
+
+Set the backend channel count to the number of TX ports the codec
+reports, the same number the AFE port is configured with, falling back
+to mono when the codec has no map.
+
+---
+--- a/sound/soc/qcom/apq8016_sbc.c
++++ b/sound/soc/qcom/apq8016_sbc.c
+@@ -406,8 +406,28 @@
+ 		channels->min = 1;
+ 		if (channels->max > 2)
+ 			channels->max = 2;
+-	} else if (cpu_dai->id == SLIMBUS_0_TX ||
+-		   cpu_dai->id == TERTIARY_MI2S_TX)
++	} else if (cpu_dai->id == SLIMBUS_0_TX) {
++		/*
++		 * The BE channel count has to be the number of codec TX ports
++		 * routed into the capture DAI ("AIF1_CAP Mixer SLIM TX7" and
++		 * "SLIM TX8" for the two mics): that is how many SLIMbus
++		 * channels the codec sends and how many the AFE port is
++		 * configured with by q6slim_set_channel_map(). The COPP that
++		 * q6routing opens takes params_channels(), which reads the
++		 * interval's min, so only setting min = 1 opened a mono COPP
++		 * for a two-port capture and the ADSP copied the first port
++		 * into every FE channel.
++		 */
++		struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++		unsigned int tx_ch[8];
++		unsigned int tx_num = 0;
++
++		if (snd_soc_dai_get_channel_map(codec_dai, &tx_num, tx_ch,
++						NULL, NULL) ||
++		    tx_num < 1 || tx_num > 4)
++			tx_num = 1;
++		channels->min = channels->max = tx_num;
++	} else if (cpu_dai->id == TERTIARY_MI2S_TX)
+ 		channels->min = 1;
+ 	else
+ 		channels->min = channels->max = 2;

@@ -1,0 +1,70 @@
+From: Lars Wikman <lars@underjord.io>
+Subject: [PATCH] ASoC: codecs: wcd9335: arm every TX port of a capture DAI
+
+wcd9335_slim_arm_tx_port() programmed the channel mask of all the DAI's
+ports into the MULTI_CHANNEL registers of the lowest port only, and
+enabled only that port. With one mic port routed that is the same thing;
+with two (SLIM TX7 and TX8, the two digital microphones on a Fairphone 3)
+the second port was never enabled. A two-channel capture recorded
+silence, and once the stream ran TX7 overflowed continuously.
+
+Program each port with its own channel bit and PORT_CFG, as the RX side
+already does in wcd9335_codec_enable_slim().
+
+---
+--- a/sound/soc/codecs/wcd9335.c
++++ b/sound/soc/codecs/wcd9335.c
+@@ -1715,32 +1715,37 @@
+ #define WCD9335_TX_PORT_CFG 0x05
+ 
+ /*
+- * Arm a capture DAI's TX port: channel mask (MULTI_CHANNEL_0/1 at
+- * 0x100/0x101 + 4 * port) and PORT_CFG (0x050 + port). The codec only
+- * activates a TX port that is already enabled when its source is
+- * connected, so this has to run before slim_stream_prepare() sends
+- * CONNECT_SOURCE. Armed later, the port stays idle until it is connected
+- * again and the first capture after boot records silence.
++ * Arm a capture DAI's TX ports: for each port its own channel bit in
++ * MULTI_CHANNEL_0/1 (0x100/0x101 + 4 * port) and PORT_CFG (0x050 + port),
++ * as the RX side does in wcd9335_codec_enable_slim() and as the vendor
++ * driver's wcd9xxx_cfg_slim_sch_tx() does. The codec only activates a TX
++ * port that is already enabled when its source is connected, so this has
++ * to run before slim_stream_prepare() sends CONNECT_SOURCE. Armed later,
++ * the port stays idle until it is connected again and the first capture
++ * after boot records silence.
++ *
++ * Programming only the lowest port with the mask of every channel, as
++ * before, left any further port idle: a two-port capture (SLIM TX7 and
++ * TX8, the two digital mics on a Fairphone 3) recorded silence, and the
++ * armed port overflowed once the stream ran.
+  */
+ static void wcd9335_slim_arm_tx_port(struct wcd9335_codec *wcd,
+ 				     struct wcd_slim_codec_dai_data *dai_data)
+ {
+ 	struct wcd9335_slim_ch *ch;
+-	u8 mc0 = 0, mc1 = 0, port = U8_MAX;
+ 
+ 	list_for_each_entry(ch, &dai_data->slim_ch_list, list) {
++		u8 mc0 = 0, mc1 = 0;
++
+ 		if (ch->shift < 8)
+-			mc0 |= BIT(ch->shift);
++			mc0 = BIT(ch->shift);
+ 		else
+-			mc1 |= BIT(ch->shift - 8);
+-		port = min_t(u8, port, ch->port);
+-	}
+-	if (port == U8_MAX)
+-		return;
++			mc1 = BIT(ch->shift - 8);
+ 
+-	wcd9335_ifc_write(wcd, 0x100 + 4 * port, mc0);
+-	wcd9335_ifc_write(wcd, 0x101 + 4 * port, mc1);
+-	wcd9335_ifc_write(wcd, 0x050 + port, WCD9335_TX_PORT_CFG);
++		wcd9335_ifc_write(wcd, 0x100 + 4 * ch->port, mc0);
++		wcd9335_ifc_write(wcd, 0x101 + 4 * ch->port, mc1);
++		wcd9335_ifc_write(wcd, 0x050 + ch->port, WCD9335_TX_PORT_CFG);
++	}
+ }
+ 
+ static int wcd9335_slim_set_hw_params(struct wcd9335_codec *wcd,
