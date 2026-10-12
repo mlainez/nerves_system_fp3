@@ -1,7 +1,7 @@
 From b6bd47d2de121af2d0392aee704b37b263d4fa8d Mon Sep 17 00:00:00 2001
 From: Marc Lainez <marc.lainez@gmail.com>
 Date: Mon, 12 Oct 2026 14:51:20 +0200
-Subject: [PATCH 07/12] clk: stub: bind the RPM clock controller on SMD based
+Subject: [PATCH 07/14] clk: stub: bind the RPM clock controller on SMD based
  SoCs
 
 On SMD RPM SoCs the rpmcc node sits below an smd-edge node without a

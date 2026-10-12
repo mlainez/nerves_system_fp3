@@ -1,7 +1,7 @@
 From f389bc6be6eeff4c8308513954f25e331e520fba Mon Sep 17 00:00:00 2001
 From: Marc Lainez <marc.lainez@gmail.com>
 Date: Mon, 12 Oct 2026 14:50:57 +0200
-Subject: [PATCH 03/12] mach-snapdragon: clock the second MSM8953 CPU cluster
+Subject: [PATCH 03/14] mach-snapdragon: clock the second MSM8953 CPU cluster
  from GPLL0
 
 The Android bootloader leaves the mux of one A53 cluster on XO and Linux

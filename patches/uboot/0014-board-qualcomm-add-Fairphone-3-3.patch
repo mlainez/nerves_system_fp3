@@ -1,7 +1,7 @@
-From 9086e89b935cb3b762711a40e0a6d96b2b0971a2 Mon Sep 17 00:00:00 2001
+From 61371678fc674532af8252a7df945a8b9054e18d Mon Sep 17 00:00:00 2001
 From: Marc Lainez <marc.lainez@gmail.com>
 Date: Mon, 12 Oct 2026 14:51:20 +0200
-Subject: [PATCH 12/12] board: qualcomm: add Fairphone 3 / 3+
+Subject: [PATCH 14/14] board: qualcomm: add Fairphone 3 / 3+
 
 U-Boot runs from the boot partition, chainloaded by the stock LK, with
 its console on the boot splash. It boots a standard boot method from
@@ -11,13 +11,13 @@ serial console modes, Volume Down starts USB fastboot.
 
 Assisted-by: Claude:claude-opus-5-5
 ---
- arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi | 46 +++++++++
+ arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi | 55 +++++++++++
  board/qualcomm/MAINTAINERS                    |  9 ++
  board/qualcomm/fairphone-fp3.config           | 10 ++
  board/qualcomm/fairphone-fp3.env              | 89 ++++++++++++++++++
  doc/board/qualcomm/fairphone-fp3.rst          | 93 +++++++++++++++++++
  doc/board/qualcomm/index.rst                  |  1 +
- 6 files changed, 248 insertions(+)
+ 6 files changed, 257 insertions(+)
  create mode 100644 arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
  create mode 100644 board/qualcomm/fairphone-fp3.config
  create mode 100644 board/qualcomm/fairphone-fp3.env
@@ -25,10 +25,10 @@ Assisted-by: Claude:claude-opus-5-5
 
 diff --git a/arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi b/arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
 new file mode 100644
-index 00000000000..3afb229b4c7
+index 00000000000..f25f7b30e0c
 --- /dev/null
 +++ b/arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,55 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
 +/ {
@@ -74,6 +74,15 @@ index 00000000000..3afb229b4c7
 +&uart_0 {
 +	pinctrl-0 = <&uart_console_pullup>;
 +	pinctrl-names = "default";
++};
++
++/*
++ * With the USB2 PHY allowed to suspend, the controller keeps it suspended
++ * after U-Boot stops USB, and the PHY PLL no longer locks when the next USB
++ * function powers it on.
++ */
++&usb3_dwc3 {
++	snps,dis_u2_susphy_quirk;
 +};
 diff --git a/board/qualcomm/MAINTAINERS b/board/qualcomm/MAINTAINERS
 index 3767a2a7949..fd8db7857bf 100644
