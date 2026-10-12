@@ -2,8 +2,11 @@
 
 set -e
 
-# Build the boot.img that lk2nd-msm8953 reads from the boot subpartition.
+# Build the boot.img that the bootloader reads from the boot subpartition.
 $NERVES_DEFCONFIG_DIR/scripts/create-boot-img.sh
+
+# Pack U-Boot for the boot partition of the phone.
+$NERVES_DEFCONFIG_DIR/scripts/create-uboot-img.sh
 
 FWUP_CONFIG=$NERVES_DEFCONFIG_DIR/fwup.conf
 

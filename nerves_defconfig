@@ -54,6 +54,24 @@ BR2_LINUX_KERNEL_DTB_OVERLAY_SUPPORT=y
 BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
 BR2_LINUX_KERNEL_INSTALL_TARGET=y
 
+# Bootloader — U-Boot on the boot partition, chainloaded by the stock LK in
+# place of lk2nd. Upstream master pinned to the commit the patches in
+# patches/uboot apply to. The Fairphone 3 support lives in those patches.
+BR2_TARGET_UBOOT=y
+BR2_TARGET_UBOOT_BUILD_SYSTEM_KCONFIG=y
+BR2_TARGET_UBOOT_CUSTOM_GIT=y
+BR2_TARGET_UBOOT_CUSTOM_REPO_URL="https://git.u-boot-project.org/u-boot/u-boot.git"
+BR2_TARGET_UBOOT_CUSTOM_REPO_VERSION="5e3b01c8466dbe45cd6a06299f8f4c7e8c1c2363"
+BR2_TARGET_UBOOT_USE_DEFCONFIG=y
+BR2_TARGET_UBOOT_BOARD_DEFCONFIG="qcom"
+BR2_TARGET_UBOOT_CONFIG_FRAGMENT_FILES="$(UBOOT_DIR)/board/qualcomm/qcom-phone.config $(UBOOT_DIR)/board/qualcomm/fairphone-fp3.config"
+BR2_TARGET_UBOOT_NEEDS_OPENSSL=y
+BR2_TARGET_UBOOT_NEEDS_GNUTLS=y
+BR2_TARGET_UBOOT_NEEDS_XXD=y
+# BR2_TARGET_UBOOT_FORMAT_BIN is not set
+BR2_TARGET_UBOOT_FORMAT_CUSTOM=y
+BR2_TARGET_UBOOT_FORMAT_CUSTOM_NAME="u-boot-nodtb.bin u-boot.dtb"
+
 # Busybox / base userland
 BR2_PACKAGE_BUSYBOX_CONFIG="${BR2_EXTERNAL_NERVES_PATH}/board/nerves-common/busybox.config"
 # Add citronics-initramfs essentials (switch_root, mdev, ln, telnetd, …)

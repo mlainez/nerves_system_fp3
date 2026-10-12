@@ -1,0 +1,244 @@
+From fa4d1196b3a9130b3e8621cf6ab405fc81676bd9 Mon Sep 17 00:00:00 2001
+From: Marc Lainez <marc.lainez@gmail.com>
+Date: Mon, 12 Oct 2026 14:51:20 +0200
+Subject: [PATCH 11/11] board: qualcomm: add Fairphone 3 / 3+
+
+U-Boot runs from the boot partition, chainloaded by the stock LK. It
+boots a standard boot method from eMMC or, like lk2nd, an image with
+its own partition table in userdata. Volume Up stops booting and moves
+the console to USB serial, Volume Down starts USB fastboot.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi | 46 +++++++++++
+ board/qualcomm/MAINTAINERS                    |  9 +++
+ board/qualcomm/fairphone-fp3.config           |  6 ++
+ board/qualcomm/fairphone-fp3.env              | 38 +++++++++
+ doc/board/qualcomm/fairphone-fp3.rst          | 77 +++++++++++++++++++
+ doc/board/qualcomm/index.rst                  |  1 +
+ 6 files changed, 177 insertions(+)
+ create mode 100644 arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
+ create mode 100644 board/qualcomm/fairphone-fp3.config
+ create mode 100644 board/qualcomm/fairphone-fp3.env
+ create mode 100644 doc/board/qualcomm/fairphone-fp3.rst
+
+diff --git a/arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi b/arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
+new file mode 100644
+index 00000000000..3afb229b4c7
+--- /dev/null
++++ b/arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/ {
++	/*
++	 * Match the Fairphone 3 entry of the stock LK so it selects this DTB
++	 * when U-Boot is packed into an Android boot image.
++	 */
++	qcom,board-id = <8 3>;
++	qcom,pmic-id = <0x10016 0x25 0x00 0x00>;
++};
++
++&tlmm {
++	/* The UART is probed before relocation, its pins must be set up by then */
++	bootph-all;
++
++	uart_console_pullup: uart-console-pullup-state {
++		bootph-all;
++
++		tx-pins {
++			bootph-all;
++			pins = "gpio4";
++			function = "blsp_uart2";
++			drive-strength = <2>;
++			bias-disable;
++		};
++
++		/* The debug UART pads are usually left unconnected */
++		rx-pins {
++			bootph-all;
++			pins = "gpio5";
++			function = "blsp_uart2";
++			drive-strength = <2>;
++			bias-pull-up;
++		};
++	};
++};
++
++/* The PRNG is owned by the secure world, any access from U-Boot traps */
++&{/soc@0/rng@e3000} {
++	status = "disabled";
++};
++
++&uart_0 {
++	pinctrl-0 = <&uart_console_pullup>;
++	pinctrl-names = "default";
++};
+diff --git a/board/qualcomm/MAINTAINERS b/board/qualcomm/MAINTAINERS
+index 3767a2a7949..fd8db7857bf 100644
+--- a/board/qualcomm/MAINTAINERS
++++ b/board/qualcomm/MAINTAINERS
+@@ -22,3 +22,12 @@ QUALCOMM DRAGONWING QCS9100
+ M:	Varadarajan Narayanan <quic_varada@quicinc.com>
+ S:	Maintained
+ N:	qcs9100
++
++FAIRPHONE 3 / 3+
++M:	Marc Lainez <marc.lainez@gmail.com>
++S:	Maintained
++F:	arch/arm/dts/sdm632-fairphone-fp3-u-boot.dtsi
++F:	board/qualcomm/fairphone-fp3.config
++F:	board/qualcomm/fairphone-fp3.env
++F:	doc/board/qualcomm/fairphone-fp3.rst
++N:	msm8953
+diff --git a/board/qualcomm/fairphone-fp3.config b/board/qualcomm/fairphone-fp3.config
+new file mode 100644
+index 00000000000..0dfff5877fb
+--- /dev/null
++++ b/board/qualcomm/fairphone-fp3.config
+@@ -0,0 +1,6 @@
++# Fairphone 3 / 3+ (SDM632), chainloaded by the stock LK as an Android boot image
++CONFIG_DEFAULT_DEVICE_TREE="qcom/sdm632-fairphone-fp3"
++CONFIG_OF_LIBFDT_OVERLAY=y
++CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/fairphone-fp3.env"
++CONFIG_BLKMAP=y
++CONFIG_CMD_SYSBOOT=y
+diff --git a/board/qualcomm/fairphone-fp3.env b/board/qualcomm/fairphone-fp3.env
+new file mode 100644
+index 00000000000..64d4d71c4a5
+--- /dev/null
++++ b/board/qualcomm/fairphone-fp3.env
+@@ -0,0 +1,38 @@
++# Fairphone 3 / 3+
++#
++# The display is not usable from U-Boot, so the console is on the debug
++# UART pads and, on request, on a USB serial gadget (CDC ACM).
++
++stdin=serial,button-kbd
++stdout=serial
++stderr=serial
++bootdelay=0
++bootretry=-1
++
++fastboot=fastboot -l $fastboot_addr_r usb 0
++
++# Move the console to USB serial and stay in U-Boot. Output is held until a
++# host opens the port (e.g. minicom -D /dev/ttyACM0).
++usb_console=setenv bootdelay -1; \
++	setenv stdin serial,button-kbd,usbacm; \
++	setenv stdout serial,usbacm; \
++	setenv stderr serial,usbacm; \
++	echo "U-Boot console on USB serial"
++
++# Hold Volume Up once the boot splash is shown to stop booting and get the
++# console over USB, hold Volume Down for fastboot.
++button_cmd_0_name=volume_up
++button_cmd_0=run usb_console
++button_cmd_1_name=Volume Down
++button_cmd_1=echo "Press any key to exit fastboot mode"; run fastboot
++
++# Like lk2nd, boot an image with its own partition table written to the
++# userdata partition, using the extlinux.conf on its first partition.
++boot_userdata=part start mmc 0 userdata ud_start && \
++	part size mmc 0 userdata ud_size && \
++	blkmap create userdata && \
++	blkmap map userdata 0 ${ud_size} linear mmc 0 ${ud_start} && \
++	blkmap get userdata dev ud_dev && \
++	sysboot blkmap ${ud_dev}:1 any ${scriptaddr} /extlinux/extlinux.conf
++
++bootcmd=bootflow scan -b; run boot_userdata; run usb_console
+diff --git a/doc/board/qualcomm/fairphone-fp3.rst b/doc/board/qualcomm/fairphone-fp3.rst
+new file mode 100644
+index 00000000000..efa2fd2d54d
+--- /dev/null
++++ b/doc/board/qualcomm/fairphone-fp3.rst
+@@ -0,0 +1,77 @@
++.. SPDX-License-Identifier: GPL-2.0+
++.. sectionauthor:: Marc Lainez <marc.lainez@gmail.com>
++
++Fairphone 3 / 3+
++================
++
++The Fairphone 3 and 3+ are smartphones based on the Qualcomm SDM632
++(MSM8953 family) SoC, with 4 GiB of RAM and 64 GiB of eMMC. Both models share
++one device tree.
++
++U-Boot runs as a second stage bootloader: the stock LK bootloader loads it from
++the ``boot`` partition as an Android boot image, like a Linux kernel. It takes
++the place lk2nd usually has on this phone.
++
++Building
++--------
++
++::
++
++  $ export CROSS_COMPILE=<aarch64 toolchain prefix>
++  $ make O=.output qcom_defconfig qcom-phone.config fairphone-fp3.config
++  $ make O=.output -j$(nproc)
++
++The stock LK expects a gzipped kernel with the device tree appended, in an
++Android boot image with 2 KiB pages and a base address of ``0x80000000``::
++
++  $ gzip -9nc .output/u-boot-nodtb.bin > .output/u-boot-nodtb.bin.gz
++  $ cat .output/u-boot-nodtb.bin.gz \
++        .output/dts/upstream/src/arm64/qcom/sdm632-fairphone-fp3.dtb \
++        > .output/u-boot-nodtb.bin.gz-dtb
++  $ printf '\0' > .output/ramdisk.img
++  $ mkbootimg --kernel .output/u-boot-nodtb.bin.gz-dtb \
++        --ramdisk .output/ramdisk.img --base 0x80000000 --pagesize 2048 \
++        --output u-boot-fp3.img
++
++The device tree carries the ``qcom,msm-id``, ``qcom,board-id`` and
++``qcom,pmic-id`` values the stock LK uses to select it.
++
++Installation
++------------
++
++The bootloader has to be unlocked. Enter LK fastboot by holding Volume Down
++while powering on. Try U-Boot from RAM first::
++
++  $ fastboot boot u-boot-fp3.img
++
++Then install it to the boot partition of the active slot::
++
++  $ fastboot flash boot u-boot-fp3.img
++
++The stock LK also applies the overlays from the ``dtbo`` partition to the
++device tree it boots. Overlays meant for Android do not match the mainline
++device tree, so ``dtbo`` should hold an empty overlay, as for lk2nd.
++
++Usage
++-----
++
++The display is not usable from U-Boot, so the console is on the debug UART
++pads, or on a USB serial gadget on request.
++
++Without a key pressed, U-Boot boots the first operating system it finds:
++
++* any standard boot method (extlinux, EFI, ...) on the eMMC partitions,
++* an image with its own partition table written to the ``userdata``
++  partition, booted with the ``extlinux.conf`` of its first partition, as
++  lk2nd does.
++
++If nothing can be booted, the console moves to USB serial.
++
++Once the boot splash is shown:
++
++* hold Volume Up to stop booting and get the U-Boot console over USB serial
++  (``minicom -D /dev/ttyACM0`` on the host),
++* hold Volume Down to start USB fastboot.
++
++Holding a key while powering on is handled by LK instead: Volume Down enters
++LK fastboot and Volume Up boots the recovery partition.
+diff --git a/doc/board/qualcomm/index.rst b/doc/board/qualcomm/index.rst
+index 56b8d894c2a..a3b50cacd3d 100644
+--- a/doc/board/qualcomm/index.rst
++++ b/doc/board/qualcomm/index.rst
+@@ -10,6 +10,7 @@ Qualcomm
+    debugging
+    dragonboard410c
+    dragonwing
++   fairphone-fp3
+    rb3gen2
+    rubikpi3
+    iq8
