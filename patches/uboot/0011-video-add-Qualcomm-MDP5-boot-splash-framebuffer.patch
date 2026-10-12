@@ -1,4 +1,4 @@
-From 83c4fe45de458cb12fcdcf0dbec5e8285ccfe9d1 Mon Sep 17 00:00:00 2001
+From fb50fe2d8d24b79c6792c5a847ce8c7a4d8758d0 Mon Sep 17 00:00:00 2001
 From: Marc Lainez <marc.lainez@gmail.com>
 Date: Mon, 12 Oct 2026 16:46:34 +0200
 Subject: [PATCH 11/14] video: add Qualcomm MDP5 boot splash framebuffer
@@ -12,8 +12,8 @@ Assisted-by: Claude:claude-opus-5-5
 ---
  drivers/video/Kconfig            |  11 ++
  drivers/video/Makefile           |   1 +
- drivers/video/qcom_mdp5_splash.c | 206 +++++++++++++++++++++++++++++++
- 3 files changed, 218 insertions(+)
+ drivers/video/qcom_mdp5_splash.c | 233 +++++++++++++++++++++++++++++++
+ 3 files changed, 245 insertions(+)
  create mode 100644 drivers/video/qcom_mdp5_splash.c
 
 diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
@@ -52,10 +52,10 @@ index 16e9ee2c11c..8d06c7c12f2 100644
  obj-$(CONFIG_VIDEO_SEPS525) += seps525.o
 diff --git a/drivers/video/qcom_mdp5_splash.c b/drivers/video/qcom_mdp5_splash.c
 new file mode 100644
-index 00000000000..1b623b1c748
+index 00000000000..7fee79a1265
 --- /dev/null
 +++ b/drivers/video/qcom_mdp5_splash.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,233 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Framebuffer driver for the display that the Android bootloader leaves
@@ -75,6 +75,7 @@ index 00000000000..1b623b1c748
 +#include <asm/io.h>
 +#include <asm/system.h>
 +#include <linux/bitfield.h>
++#include <linux/delay.h>
 +#include <linux/sizes.h>
 +
 +/* Offsets from the MDSS base ("mdss_phys") */
@@ -142,17 +143,42 @@ index 00000000000..1b623b1c748
 + * Push a frame to a command mode panel. This runs before the uclass flushes
 + * the cache, so flush the framebuffer here first.
 + */
-+static int mdp5_splash_sync(struct udevice *dev)
++static void mdp5_splash_kick(struct udevice *dev)
 +{
 +	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
++	struct mdp5_splash_priv *priv = dev_get_priv(dev);
++
++	flush_dcache_range(plat->base, ALIGN(plat->base + plat->size, SZ_4K));
++	writel(1, priv->ctl + CTL_START);
++	priv->last_kick = get_timer(0);
++}
++
++static int mdp5_splash_sync(struct udevice *dev)
++{
 +	struct mdp5_splash_priv *priv = dev_get_priv(dev);
 +
 +	if (!priv->cmd_mode || get_timer(priv->last_kick) < MDP5_KICK_MS)
 +		return 0;
 +
-+	flush_dcache_range(plat->base, ALIGN(plat->base + plat->size, SZ_4K));
-+	writel(1, priv->ctl + CTL_START);
-+	priv->last_kick = get_timer(0);
++	mdp5_splash_kick(dev);
++
++	return 0;
++}
++
++/*
++ * Updates are rate limited, so the last lines printed before the OS starts
++ * may not have been pushed yet: push them once the previous frame is out.
++ */
++static int mdp5_splash_remove(struct udevice *dev)
++{
++	struct mdp5_splash_priv *priv = dev_get_priv(dev);
++
++	if (!priv->cmd_mode)
++		return 0;
++
++	mdelay(MDP5_KICK_MS);
++	mdp5_splash_kick(dev);
++	mdelay(MDP5_KICK_MS);
 +
 +	return 0;
 +}
@@ -258,7 +284,8 @@ index 00000000000..1b623b1c748
 +	.of_match = mdp5_splash_ids,
 +	.ops	= &mdp5_splash_ops,
 +	.probe	= mdp5_splash_probe,
++	.remove	= mdp5_splash_remove,
 +	.priv_auto = sizeof(struct mdp5_splash_priv),
 +	/* The display is already powered and clocked; leave it alone. */
-+	.flags	= DM_FLAG_DEFAULT_PD_CTRL_OFF,
++	.flags	= DM_FLAG_DEFAULT_PD_CTRL_OFF | DM_FLAG_OS_PREPARE,
 +};

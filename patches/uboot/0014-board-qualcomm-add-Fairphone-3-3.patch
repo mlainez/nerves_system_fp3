@@ -1,4 +1,4 @@
-From fc2f3e3c32e6617d60c15bb48925f25816fd0bae Mon Sep 17 00:00:00 2001
+From 2efed6535d0dd6aaa439b0440989c11ace58bee3 Mon Sep 17 00:00:00 2001
 From: Marc Lainez <marc.lainez@gmail.com>
 Date: Mon, 12 Oct 2026 14:51:20 +0200
 Subject: [PATCH 14/14] board: qualcomm: add Fairphone 3 / 3+

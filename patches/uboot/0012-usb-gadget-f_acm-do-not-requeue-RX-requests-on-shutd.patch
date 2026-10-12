@@ -1,4 +1,4 @@
-From 87e12acd3f09d552da8fc06b59a102a3e9cafa56 Mon Sep 17 00:00:00 2001
+From 0ded7398642d3bc2e402e64a23c3c379f191e47b Mon Sep 17 00:00:00 2001
 From: Marc Lainez <marc.lainez@gmail.com>
 Date: Mon, 12 Oct 2026 17:18:45 +0200
 Subject: [PATCH 12/14] usb: gadget: f_acm: do not requeue RX requests on
