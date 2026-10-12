@@ -2,7 +2,7 @@
 #
 # create-boot-img.sh
 #
-# Builds the ext2 "boot" image that lk2nd-msm8953 reads at boot.
+# Builds the ext2 "boot" image that U-Boot reads at boot.
 # Layout inside the image:
 #
 #   /Image                          — kernel

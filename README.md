@@ -10,7 +10,7 @@ Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 | Memory       | 4 GB LPDDR3, 64 GB eMMC                                     |
 | Storage      | eMMC; firmware lives inside the Android `userdata` partition|
 | Linux        | `mlainez/linux-msm8953`, 6.19                               |
-| Bootloader   | lk2nd-msm8953 → `extlinux/extlinux.conf` on the boot partition |
+| Bootloader   | U-Boot on the boot partition → `extlinux/extlinux.conf` in `userdata` |
 | Console      | On-device display (`tty1`) or serial debug pads (`ttyMSM0`) |
 | Cellular     | 2G/3G/LTE dual SIM over QMI                                 |
 | Wi-Fi / BT   | wcnss/prima via remoteproc, BlueZ userspace                 |
@@ -151,29 +151,41 @@ built that way is not reproducible by anyone else.
 
 ## Flashing
 
-The stock Fairphone 3 bootloader will not chain-load a foreign kernel, so
-[lk2nd](https://github.com/msm8916-mainline/lk2nd) goes on `boot` and the
-Nerves firmware into `userdata`. The stock bootloader also applies the
-device-tree overlays in `dtbo` to whatever it boots, and Android's
-overlays don't match lk2nd, so `dtbo` gets the dummy overlay from
-[z3ntu/dtbo-fp3](https://github.com/z3ntu/dtbo-fp3/releases).
+The stock Fairphone 3 bootloader (LK) will not chain-load a mainline kernel,
+so U-Boot goes on `boot` and the Nerves firmware into `userdata`. The system
+builds U-Boot from upstream plus the patches in `patches/uboot` and packs it
+as `u-boot-fp3.img` in the images directory. The stock bootloader also
+applies the device-tree overlays in `dtbo` to whatever it boots, and
+Android's overlays don't match the mainline device tree, so `dtbo` gets the
+dummy overlay from [z3ntu/dtbo-fp3](https://github.com/z3ntu/dtbo-fp3/releases).
 
 Enable **Developer options → OEM unlocking** in Android first, then:
 
 ```bash
-# Boot into fastboot: hold Volume Down while powering on, USB attached.
+# Boot into LK fastboot: hold Volume Down while powering on, USB attached.
 fastboot flashing unlock              # once per device, erases the phone
 fastboot set_active a
 fastboot flash dtbo dtbo.img          # dummy overlay from z3ntu/dtbo-fp3
-fastboot flash boot lk2nd-msm8953.img # from the lk2nd releases
+fastboot boot u-boot-fp3.img          # optional: try U-Boot from RAM first
+fastboot flash boot_a u-boot-fp3.img
 fastboot flash userdata fp3_demo.img  # from `mix firmware.image`
 fastboot reboot
 ```
 
-After that, `mix upload` works over the network as usual. Holding
-Volume Down at power-on now opens lk2nd's fastboot mode (wait until the
-screen turns on before pressing it), from which `userdata` can be
-reflashed.
+After that, `mix upload` works over the network as usual.
+
+U-Boot draws its console over the boot splash. During its first five
+seconds, Volume Up opens a boot menu (Volume Up/Down move, Power selects)
+and Volume Down starts U-Boot fastboot. The menu offers:
+
+* **USB disk (userdata)**: only `userdata` as a USB mass storage device,
+  so `fwup` can write a firmware from the host
+  (`fwup -a -i fp3.fw -t complete -d /dev/sdX`); any key leaves it,
+* **USB fastboot**, **USB serial console** (`/dev/ttyACM0`),
+* **Reboot to LK fastboot**, **Reboot**, **Power off**.
+
+Holding Volume Down while powering on still enters LK fastboot, from which
+`boot_a` can always be reflashed.
 
 ## Partition layout
 
@@ -193,7 +205,7 @@ early, exposing `/dev/mmcblk0p62p1` … `p3`.
 └─ Application     (f2fs, fills the rest, mounted at /root)
 ```
 
-lk2nd reads `/extlinux/extlinux.conf` from the active boot subpartition and
+U-Boot reads `/extlinux/extlinux.conf` from the active boot subpartition and
 loads `Image`, `sdm632-fairphone-fp3.dtb` and `initramfs.gz`. The kernel
 command line passes `rootfs=` and `bootpart=` to the initramfs, which maps
 the subpartitions, mounts the rootfs read-only and `switch_root`s into it.
