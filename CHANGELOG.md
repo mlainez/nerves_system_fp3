@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The kernel is built from `linux-msm8953` 6.19 staging `982eef40aa9e`.
+  The PMI632 charger now uses the current upstream `qcom_smbx` SMB5
+  support (v4 on the list) and the fixes merged for it since, including
+  the watchdog, float-voltage and overvoltage fixes.
+
 ## v0.3.0
 
 The cameras now run through the phone's camera image processor (the
