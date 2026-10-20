@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The kernel moves to Linux 7.3: `linux-msm8953` `7.3/staging`
+  `6cfa4b0970ba`, built on msm8953-mainline's 7.3 tree. Every 6.19 topic
+  is carried over; the PMI632 charger uses the current upstream
+  `qcom_smbx` SMB5 support and the fixes merged for it.
+- `linux-6.19.defconfig` is replaced by `linux-7.3.defconfig`. IPv6 and
+  netfilter netlink are built in, as 7.3 no longer offers them as
+  modules.
+
 ## v0.3.0
 
 The cameras now run through the phone's camera image processor (the

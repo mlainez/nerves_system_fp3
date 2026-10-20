@@ -9,7 +9,7 @@ Snapdragon 632 (MSM8953), aarch64. One firmware image runs on both.
 | GPU          | Adreno 506 — OpenGL ES (Mesa Freedreno)                     |
 | Memory       | 4 GB LPDDR3, 64 GB eMMC                                     |
 | Storage      | eMMC; firmware lives inside the Android `userdata` partition|
-| Linux        | `mlainez/linux-msm8953`, 6.19                               |
+| Linux        | `mlainez/linux-msm8953`, 7.3                                |
 | Bootloader   | lk2nd-msm8953 → `extlinux/extlinux.conf` on the boot partition |
 | Console      | On-device display (`tty1`) or serial debug pads (`ttyMSM0`) |
 | Cellular     | 2G/3G/LTE dual SIM over QMI                                 |
